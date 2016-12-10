@@ -1,12 +1,13 @@
 # letsencrypt_strongswan_guide
 
 ##Requirement
-* a domain name: for example **vpn.example.com**
+* A domain name: for example **vpn.example.com**
 * VPS: such as [Linode VPS](https://www.linode.com/)
+* Ports 4500/UDP, 500/UDP, 51/UDP and 50/UDP opened in the firewall
 
 ##VPN Server Setup
 ###Build strongswan
-openssl library is required for add ECP521/ECP384/ECP256 & ECDSA support
+openssl >= 1.0.2 is required for add ECP521/ECP384/ECP256 & ECDSA support
 ```
 # apt-get install libssl-dev
 ```
@@ -21,7 +22,7 @@ openssl library is required for add ECP521/ECP384/ECP256 & ECDSA support
 # git clone https://github.com/acmesh-official/acme.sh
 ```
 
-####[ECDSA certiifcate](https://en.wikipedia.org/wiki/Elliptic_Curve_Digital_Signature_Algorithm)
+####[ECDSA certiifcate](https://en.wikipedia.org/wiki/Elliptic_Curve_Digital_Signature_Algorithm) recommend
 ```
 # ./acme.sh --issue --standalone -d vpn.example.com --keylength ec-384
 
