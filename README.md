@@ -2,8 +2,8 @@
 
 [![letsencrypt](res/images/letsencrypt-logo-horizontal.png)](https://letsencrypt.org/) ![puls](res/images/add-symbolic.symbolic.png) [![strongswan](res/images/strongswan.png)](https://strongswan.org/)
 ##Requirement
-* A domain name: for example **vpn.example.com**
-* VPS: such as [Linode VPS](https://www.linode.com/)
+* A domain name: for example **vpn.example.com** and resolve to VPS public IP
+* VPS: [Linode VPS](https://www.linode.com/)
 * Ports 4500/UDP, 500/UDP, 51/UDP and 50/UDP opened in the firewall
 
 ## 1. Setup VPN Server
