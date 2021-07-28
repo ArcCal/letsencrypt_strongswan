@@ -1,6 +1,6 @@
 # letsencrypt_strongswan_guide
 
-[![letsencrypt](res/images/letsencrypt-logo-horizontal.png)](https://letsencrypt.org/) ![puls](res/images/add-symbolic.symbolic.png) [![strongswan](res/images/strongswan.png)](https://strongswan.org/)
+[![letsencrypt](res/images/letsencrypt-logo-horizontal.png)](https://letsencrypt.org/) ![puls](res/images/add-symbolic.symbolic.png) [![strongswan](res/images/strongswan.png)](https://strongswan.org/)           
 ##Requirement
 * A domain name: for example **vpn.example.com** and resolve to VPS public IP
 * VPS: [Linode VPS](https://www.linode.com/)
@@ -29,10 +29,11 @@
 ```
 ##### [RSA certificate](https://en.wikipedia.org/wiki/RSA_(cryptosystem))
 ```
-# ./acme.sh --issue --standalone -d vpn.example.com --keylength 4096
+# ./acme.sh --issue --standalone -d vpn.example.com --keylength 4096 --server letsencrypt
 ```
 #### 1.2.2 install certificates in strongswan
 ```
+# cp ca.cer /etc/ipsec.d/cacerts/
 # cp fullchain.cer  /etc/ipsec.d/certs/acme_xyz_server.cert.pem
 # cp vpn.example.com.key  /etc/ipsec.d/private/acme_xyz_ecc.pem
 ```
