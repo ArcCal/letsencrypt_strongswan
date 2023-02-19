@@ -115,7 +115,7 @@ enable sysctl rules
 * [Window 7+](https://wiki.strongswan.org/projects/strongswan/wiki/Windows7#C)
 * [iOS & MAC OSX](https://wiki.strongswan.org/projects/strongswan/wiki/AppleClients)
 * [Android 4+](https://wiki.strongswan.org/projects/strongswan/wiki/AndroidVPNClient)    
-##### additional NOTES:  #####
+##### additional NOTES for android app to handle multi SSL certificate on one server:  #####
 Set the server identity to match the server certificate and leave CA certificate selection automatic.
 * Linux       
 
