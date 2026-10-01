@@ -1,0 +1,8 @@
+# /etc/letsencrypt/cloudflare.ini   (chmod 600, owner root)
+# 推荐:限定权限的 API Token(Zone:DNS:Edit,仅限你的域名所在 zone)
+dns_cloudflare_api_token = 0123456789abcdef0123456789abcdef01234567
+
+# 不推荐:Global API Key(权限覆盖整个账号)。使用时请删掉上面的 token 行,
+# 因为 token 与 email/api_key 不能同时出现。
+# dns_cloudflare_email = you@example.com
+# dns_cloudflare_api_key = 0123456789abcdef0123456789abcdef01234
