@@ -1,6 +1,7 @@
 #!/bin/sh
 # /etc/letsencrypt/renewal-hooks/deploy/strongswan.sh
-# After successful issuance/renewal, install certificates into swanctl and hot reload.
+# Run by certbot after every successful issuance/renewal; installs the certificate into the
+# swanctl directories and hot-reloads it.
 # certbot sets RENEWED_LINEAGE=/etc/letsencrypt/live/<domain>
 set -eu
 
