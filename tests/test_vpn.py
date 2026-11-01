@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 from pathlib import Path
 import plistlib
@@ -14,6 +15,19 @@ spec.loader.exec_module(vpn)
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_public_ipv4_accepts_cloud_nat_external_address(self):
+        # A GCE NIC may only have 10.x addresses; the external IP is cloud-side.
+        with mock.patch.object(vpn.urllib.request, 'urlopen', return_value=io.BytesIO(b'8.8.4.4\n')) as request:
+            self.assertEqual(vpn.public_ipv4(), '8.8.4.4')
+            request.assert_called_once_with('https://api.ipify.org', timeout=10)
+
+    def test_public_ipv4_rejects_nonpublic_and_malformed_responses(self):
+        for address in (b'10.128.0.2', b'127.0.0.1', b'169.254.169.254', b'::1', b'2606:4700:4700::1111', b'not-an-ip'):
+            with self.subTest(address=address), mock.patch.object(
+                    vpn.urllib.request, 'urlopen', return_value=io.BytesIO(address)):
+                with self.assertRaises(ValueError):
+                    vpn.public_ipv4()
+
     def test_random_accounts_character_classes(self):
         users = [vpn.account() for _ in range(200)]
         self.assertEqual(len({u['username'] for u in users}), len(users))

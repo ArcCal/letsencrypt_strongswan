@@ -8,13 +8,15 @@ The server authenticates with a Let's Encrypt certificate. Clients authenticate 
 ## 1. Requirements
 
 - A fresh, dedicated Debian 13 or Ubuntu 24.04 / 26.04 VPS booted with **systemd**, with a root terminal. The installer uses distribution packages, without compiling strongSwan.
-- A public IPv4 **directly assigned to the server interface**, optionally public IPv6. NAT VPS, HTTP proxy egress and production containers are unsupported.
+- An inbound-reachable public IPv4 address, either assigned directly to a NIC or mapped to its private address by the cloud provider, such as a Google Compute Engine External IP. Public IPv6 is optional. Ordinary containers are not supported for production deployment.
 - Kernel support for IPsec/XFRM, ESP, nftables, and IPv6. IPv6 kernel support is required for the dual-stack tunnel even without a public IPv6 address. A running IKE daemon alone does not prove ESP data-plane support.
 - An active Cloudflare DNS zone for the certificate domain, for example `vpn.example.com`. **The domain does not need to point to the VPS or have A/AAAA records.**
 - Allow inbound **UDP 500 and UDP 4500** in the cloud security group and upstream firewall. For plain ESP without NAT-T, allow **IP protocol 50**, not UDP port 50. Preserve SSH access.
 - Access to distribution package repositories, Cloudflare API, Let's Encrypt ACME API, and `api.ipify.org`. The system clock must be accurate.
 
 The installer **does not create, modify, or delete A/AAAA/CNAME address records**. Cloudflare is used only for the `_acme-challenge` TXT records needed for certificate issuance and renewal. Clients connect to the automatically detected **VPS public IPv4 address**, while the certificate identity remains the **domain** you enter.
+
+**Google Cloud and cloud-side NAT:** a NIC with only a private `10.x` address is normal. The public IP is not required to appear in `ip address`. strongSwan listens on local addresses and uses IKE NAT detection to enable UDP 4500 encapsulation. Configure an External IP for the GCE instance and allow inbound UDP 500/4500 to it; a static external IP is recommended. HTTPS egress detection does not establish inbound reachability. An instance with only Cloud NAT outbound access and no external IP or inbound port mapping cannot directly serve as a public VPN server. Shared NAT requires UDP 500/4500 forwarding to the instance. An HTTP proxy exit address may also differ from the inbound endpoint; check the server IP in the generated profiles.
 
 The dedicated-server firewall defaults to dropping inbound traffic. It allows established traffic, loopback, DHCP maintenance, ICMP/ICMPv6, detected SSH TCP ports, IKE/NAT-T, and ESP. Web ports are not opened. The installer stops on unmanaged nftables/iptables-nft tables, active ufw/firewalld, legacy strongSwan, existing swanctl configurations, or certbot certificates for other domains. **Do not run it directly on a production machine with existing complex networking, firewalls, or container services.**
 

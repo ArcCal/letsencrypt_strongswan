@@ -8,7 +8,6 @@ import plistlib
 import re
 import secrets
 import string
-import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -203,10 +202,9 @@ def public_ipv4():
         address = ipaddress.ip_address(response.read(128).decode().strip())
     if address.version != 4 or not address.is_global:
         raise ValueError('Could not detect a public IP address')
-    # Refuse proxy/NAT addresses not actually assigned to this VPS.
-    interfaces = json.loads(subprocess.check_output(['ip', '-j', 'address', 'show']))
-    if not any(info['local'] == str(address) for interface in interfaces for info in interface.get('addr_info', [])):
-        raise ValueError('The public address is not assigned to this host; NAT VPS and proxy egress are not supported')
+    # GCE and other clouds map external IPs to private NIC addresses. The public
+    # client endpoint must not be required to appear on a local interface.
+    # Observing the egress address does not prove inbound UDP reachability.
     return str(address)
 
 
