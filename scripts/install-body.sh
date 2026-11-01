@@ -54,16 +54,22 @@ apt-get install -y -o Dpkg::Options::=--force-confold --no-install-recommends \
     "${SWAN_PACKAGES[@]}" nftables \
     certbot python3-certbot-dns-cloudflare python3 openssl iproute2 procps ca-certificates
 
-# Refuse unmanaged rules/configuration instead of flushing someone else's firewall.
+# Reject existing firewall tables on first installation; preserve them on reruns.
 python3 - <<'PY'
 import json, pathlib, subprocess, sys
 managed = pathlib.Path('/var/lib/ikev2-vpn/managed').exists()
 tables = json.loads(subprocess.check_output(['nft', '-j', 'list', 'tables']))['nftables']
 owned = {('inet', 'ikev2_vpn'), ('ip', 'ikev2_vpn_nat'), ('ip6', 'ikev2_vpn_nat6')}
+external = []
 for entry in tables:
     table = entry.get('table')
-    if table and (not managed or (table['family'], table['name']) not in owned):
+    if table and not managed:
         sys.exit('Unmanaged nftables/iptables-nft rules exist. Deploy on a dedicated VPS.')
+    if table and (table['family'], table['name']) not in owned:
+        external.append(table['family'] + ' ' + table['name'])
+if external:
+    print('Preserving external firewall tables: ' + ', '.join(external) +
+          '. Their policies may affect VPN traffic.', file=sys.stderr)
 directory = pathlib.Path('/etc/swanctl/conf.d')
 for path in directory.glob('*.conf'):
     if path.name == 'ikev2-vpn.conf' and managed:

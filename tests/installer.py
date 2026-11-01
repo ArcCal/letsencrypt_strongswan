@@ -119,11 +119,21 @@ else:
         path.write_text(text)
         path.chmod(0o700)
     try:
+        run(['nft', 'add', 'table', 'ip', 'filter'])
+        run(['nft', 'add', 'chain', 'ip', 'filter', 'ts-input'])
+        run(['nft', 'add', 'rule', 'ip', 'filter', 'ts-input', 'udp', 'dport', '41641', 'accept'])
+        external = run(['nft', '-s', 'list', 'table', 'ip', 'filter']).stdout
+        status, output = terminal_install()
+        assert status != 0 and 'Unmanaged nftables/iptables-nft rules exist' in output
+        assert not (STATE / 'managed').exists() and not (STATE / 'state.json').exists()
+        assert run(['nft', '-s', 'list', 'table', 'ip', 'filter']).stdout == external
+        run(['nft', 'delete', 'table', 'ip', 'filter'])
         status, output = terminal_install(fail=True)
         assert status != 0, 'Injected issuance failure was ignored'
         first = json.loads((STATE / 'state.json').read_text())
         assert (STATE / 'managed').exists(), 'Partial installation lost its ownership marker'
         Path('/var/log/letsencrypt/audit-install-failed.log').write_text(output)
+        run(['nft', '-f', '-'], input=external)
         for index in range(2):
             status, output = terminal_install()
             Path(f'/var/log/letsencrypt/audit-install-{index}.log').write_text(output)
@@ -132,6 +142,8 @@ else:
                 raise RuntimeError(f'Full installer failed with status {status}')
             assert json.loads((STATE / 'state.json').read_text())['users'] == first['users']
             assert 'Deployment complete.' in output
+            assert 'Preserving external firewall tables: ip filter' in output
+            assert run(['nft', '-s', 'list', 'table', 'ip', 'filter']).stdout == external
             for path in [STATE / 'state.json', Path('/tmp/usr.txt'), Path('/etc/letsencrypt/cloudflare.ini'),
                          *list((STATE / 'profiles').glob('*.mobileconfig'))]:
                 assert path.stat().st_mode & 0o777 == 0o600, path
@@ -139,8 +151,9 @@ else:
         assert '2222' in rules, 'Socket-activated SSH port was not allowed'
         run(['systemctl', 'start', 'ikev2-vpn-renew.service'])
         assert run(['systemctl', 'show', 'ikev2-vpn-renew.service', '-p', 'Result', '--value']).stdout.strip() == 'success'
-        print('Full terminal installer: failure recovery, two prompts, hidden token, repeatability, SSH socket and sandboxed renewal passed.')
+        print('Full terminal installer: first-install firewall rejection, external table preservation on reruns, failure recovery, two prompts, hidden token, repeatability, SSH socket and sandboxed renewal passed.')
     finally:
+        subprocess.run(['nft', 'delete', 'table', 'ip', 'filter'], check=False)
         run(['systemctl', 'stop', 'ssh.socket'])
         subprocess.run(['systemctl', 'stop', 'ssh.service'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for name in ('ssh.socket', 'ssh.service'):
