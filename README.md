@@ -1,421 +1,224 @@
-# Let's Encrypt + strongSwan: Manual IKEv2 VPN Deployment Guide
+# Let's Encrypt + strongSwan: IKEv2 VPN with two inputs
 
-[![letsencrypt](res/images/letsencrypt-logo-horizontal.png)](https://letsencrypt.org/) ![plus](res/images/add-symbolic.symbolic.png) [![strongswan](res/images/strongswan.png)](https://strongswan.org/)
+Run `install.sh` on a dedicated VPS, entering only **VPN domain** and **Cloudflare API token**.
+The script installs strongSwan, obtains a public CA certificate through certbot and Cloudflare DNS-01, generates two random accounts and two iPhone `.mobileconfig` files, and configures full tunneling, firewall and automatic renewal.
 
-Manually set up an IKEv2 VPN on **Debian 13 (trixie) x64** or **Ubuntu 26.04 LTS x64**, **using only the distribution's own packages** (no compiling from source):
+The server authenticates with a Let's Encrypt certificate. Clients authenticate with **EAP-MSCHAPv2 usernames and passwords**. Clients do not need client certificates or a private CA installation. Server certificate and domain validation remain enabled.
 
-| Component | Choice |
-|---|---|
-| VPN software | strongSwan 6.x (`charon-systemd` + `swanctl`, i.e. the modern `swanctl.conf` configuration) |
-| Server authentication | Let's Encrypt certificate (certbot, Cloudflare **DNS-01** challenge) |
-| Client authentication | EAP-MSCHAPv2 (username + password) |
-| Clients | Built-in or strongSwan clients on iOS / macOS / Windows / Android / Linux; no extra certificates needed |
-| Firewall | nftables |
+## 1. Requirements
 
-> **Differences from the old guide**: the old version compiled strongSwan 5.x from source and used `ipsec.conf` / `ipsec start` (`starter`), `acme.sh` + `--standalone` (which occupies port 80), and iptables.
-> The new version uses apt packages, `swanctl.conf` + systemd, certbot + Cloudflare DNS (no need to open ports 80/443, and wildcard domains are supported), and nftables.
+- A fresh, dedicated Debian 13 or Ubuntu 24.04 / 26.04 VPS booted with **systemd**, with a root terminal. The installer uses distribution packages, without compiling strongSwan.
+- A public IPv4 **directly assigned to the server interface**, optionally public IPv6. NAT VPS, HTTP proxy egress and production containers are unsupported.
+- Kernel support for IPsec/XFRM, ESP, nftables, and IPv6. IPv6 kernel support is required for the dual-stack tunnel even without a public IPv6 address. A running IKE daemon alone does not prove ESP data-plane support.
+- Domain DNS hosted in an active Cloudflare zone. Use a dedicated subdomain such as `vpn.example.com`, separate from existing websites or mail services.
+- Allow inbound **UDP 500 and UDP 4500** in the cloud security group and upstream firewall. For plain ESP without NAT-T, allow **IP protocol 50**, not UDP port 50. Preserve SSH access.
+- Access to distribution repositories, Cloudflare API, Let's Encrypt ACME API and `api.ipify.org`; IPv6 also requires `api6.ipify.org`. Accurate system time is required.
 
-## Table of Contents
+The script detects addresses and sets domain A/AAAA records to **DNS only**. Existing address records are updated and deduplicated; stale AAAA records are deleted if public IPv6 is unavailable. TXT/MX records are unchanged. Existing CNAME causes an error and is not deleted.
 
-1. [Prerequisites](#1-prerequisites)
-2. [Create a Cloudflare API Token](#2-create-a-cloudflare-api-token)
-3. [Install Packages](#3-install-packages)
-4. [Obtain a Certificate with certbot](#4-obtain-a-certificate-with-certbot)
-5. [Configure strongSwan](#5-configure-strongswan)
-6. [Kernel Parameters and Firewall](#6-kernel-parameters-and-firewall)
-7. [Start and Verify](#7-start-and-verify)
-8. [Client Configuration](#8-client-configuration)
-9. [Routine Maintenance](#9-routine-maintenance)
-10. [Troubleshooting](#10-troubleshooting)
-11. [What This Guide Has Been Verified Against](#11-what-this-guide-has-been-verified-against)
+The dedicated-server firewall defaults to dropping inbound traffic. It allows established traffic, loopback, DHCP maintenance, ICMP/ICMPv6, detected SSH TCP ports, IKE/NAT-T, and ESP. Web ports are not opened. The installer stops on unmanaged nftables/iptables-nft tables, active ufw/firewalld, legacy strongSwan, existing swanctl configurations, or certbot certificates for other domains. **Do not run it directly on a production machine with existing complex networking, firewalls, or container services.**
 
-The `config/` directory in this repository contains every configuration file used in this guide, ready to copy:
+Installation automatically accepts the [Let's Encrypt terms of service](https://letsencrypt.org/repository/) and registers an ACME account without an email address to avoid another prompt. Read the terms before use.
 
-| File | Deploy to |
-|---|---|
-| [`config/cloudflare.ini.example`](config/cloudflare.ini.example) | `/etc/letsencrypt/cloudflare.ini` |
-| [`config/certbot-deploy-hook.sh`](config/certbot-deploy-hook.sh) | `/etc/letsencrypt/renewal-hooks/deploy/strongswan.sh` |
-| [`config/ikev2-eap.conf`](config/ikev2-eap.conf) | `/etc/swanctl/conf.d/ikev2-eap.conf` |
-| [`config/secrets.conf.example`](config/secrets.conf.example) | `/etc/swanctl/conf.d/secrets.conf` |
-| [`config/99-vpn-sysctl.conf`](config/99-vpn-sysctl.conf) | `/etc/sysctl.d/99-vpn.conf` |
-| [`config/nftables-vpn.conf`](config/nftables-vpn.conf) | `/etc/nftables.conf` |
-| [`config/client-linux.conf`](config/client-linux.conf) | `/etc/swanctl/conf.d/vpn-client.conf` on the Linux client |
+## 2. Create a Cloudflare token
 
----
+Create an API token scoped to the target domain zone:
 
-## 1. Prerequisites
+| Scope | Permission |
+| --- | --- |
+| Zone | Zone -> Read |
+| Zone | DNS -> Edit |
+| Zone Resources | Include: Specific zone: the target zone |
 
-1. **A VPS**: Debian 13 or Ubuntu 26.04 LTS, x86-64, with a public IPv4 address (IPv6 optional). All commands below are run as root (regular users should run `sudo -i` first).
-2. **A domain whose DNS is hosted on Cloudflare**, e.g. `vpn.example.com`.
-   - Add an **A record** (plus an **AAAA** record if you have IPv6) pointing to the VPS's public IP.
-   - **It must be set to "DNS only" (grey cloud)**. Do not enable the Cloudflare proxy (orange cloud); the proxy does not forward IKE's UDP traffic.
-3. **Open the ports**: in your cloud provider's security group / firewall, allow inbound **UDP 500** and **UDP 4500** (plus your SSH port).
-   The "UDP 50/51" mentioned in the old guide are not UDP ports but the ESP/AH protocol numbers. Modern clients are almost always behind NAT, where ESP is encapsulated in UDP 4500, so the cloud security group only needs UDP 500 / 4500.
-4. The system clock must be accurate (certificate validity and IKE both depend on it):
+Zone Read locates the domain zone. DNS Edit updates A/AAAA records and creates/removes `_acme-challenge` TXT records during issuance/renewal. No Global API Key is needed. Keep the token valid for renewal and include server egress if source IP restrictions apply.
+
+## 3. Deploy with exactly two prompts
+
+Log into the VPS as root, clone the full repository and run:
 
 ```sh
-timedatectl status          # look for "System clock synchronized: yes"
+git clone https://github.com/ArcCal/letsencrypt_strongswan.git
+cd letsencrypt_strongswan
+bash install.sh
 ```
 
-Conventions used below: domain `vpn.example.com`, IPv4 client address pool `10.10.10.0/24`, IPv6 address pool `fd10:10:10::/64`. Replace them with your own values throughout.
+Install `git` with the distribution package manager first if using the checkout method. A regular user can enter a root shell with `sudo -i` before running these commands. System sudo authentication is separate from the installer prompts.
 
-## 2. Create a Cloudflare API Token
+The installer asks only:
 
-certbot proves domain ownership by temporarily writing a TXT record at `_acme-challenge.vpn.example.com` through the Cloudflare API.
+```text
+VPN certificate domain (FQDN): vpn.example.com
+Cloudflare API token (hidden input):
+```
 
-1. Log in to Cloudflare -> avatar in the top-right corner -> **My Profile** -> **API Tokens** -> **Create Token**.
-2. Choose the **Edit zone DNS** template, or create a custom token with:
-   - Permissions: **Zone -> DNS -> Edit**
-   - Zone Resources: **Include -> Specific zone -> your domain** (e.g. `example.com`)
-3. Copy the token after creating it (it is only shown once).
+Use a full domain without scheme, port, path or wildcard; international domains require punycode.
+The token is hidden, never passed in arguments or written to account files. Avoid `bash -x` and shared terminal recordings. Invalid inputs or permissions cause an error and exit without further prompts.
 
-> The official certbot-dns-cloudflare documentation recommends this kind of **scoped API Token**. The "Global API Key" (account-wide full permissions) is still supported but **not recommended**: if it leaks, your entire account is compromised. If you only have a Global API Key, see the next section for the format.
+The installer automatically:
 
-## 3. Install Packages
+1. Checks the system, concurrent installation, and conflicting services, then installs packages noninteractively.
+2. Verify Cloudflare zone permissions, detect public addresses and update the VPN domain DNS.
+3. Generates and persists two cryptographically random accounts and renders server configuration and Apple profiles.
+4. Obtains an ECDSA P-256 certificate through certbot DNS-01, with a 60-second DNS propagation delay. Ports 80/443 are not required.
+5. Deploys the leaf certificate, private key, and individually split intermediate certificates after checking expiration, hostname, and key matching.
+6. Configures forwarding, IPv6 RA handling, dedicated nftables tables, boot services, and the certificate timer.
+7. Starts strongSwan, loads accounts, certificates, connections, and pools, and checks service status.
 
-The commands are the same on both distributions:
+Package installation and DNS propagation can take several minutes. Errors from networking, Cloudflare, the CA, or the firewall stop deployment with diagnostic output. A Cloudflare token cannot modify cloud-provider security groups or repair blocked upstream UDP traffic.
+
+## 4. Random accounts and output files
+
+Each username has **8 uppercase/lowercase letters and digits**, including at least one uppercase letter, one lowercase letter, and one digit. Each password has **22 characters**, including uppercase/lowercase letters, digits, and at least one symbol from `!@#%+-_=.:?`. This alphabet avoids configuration escaping problems. Generation uses Python `secrets`, backed by the operating system random source. The two usernames are distinct.
 
 ```sh
-apt update
-apt install -y \
-    strongswan-swanctl charon-systemd \
-    libcharon-extra-plugins libcharon-extauth-plugins libstrongswan-extra-plugins \
-    nftables \
-    certbot python3-certbot-dns-cloudflare
+cat /tmp/usr.txt
+ls -l /var/lib/ikev2-vpn/profiles/
 ```
 
-What each package does:
+| File | Contents |
+| --- | --- |
+| `/tmp/usr.txt` | Both random accounts, server endpoint, and profile paths |
+| `/var/lib/ikev2-vpn/profiles/<username>.mobileconfig` | One iPhone profile per user, including that user's credentials |
+| `/var/lib/ikev2-vpn/state.json` | Persistent state for both users, reused on reruns |
+| `/etc/letsencrypt/cloudflare.ini` | Cloudflare token for certificate renewal |
+| `/etc/swanctl/conf.d/ikev2-vpn.conf` | Generated connection, dual-stack pools, and both EAP accounts |
 
-| Package | Purpose |
-|---|---|
-| `charon-systemd` | strongSwan's IKE daemon; provides the systemd service `strongswan.service` |
-| `strongswan-swanctl` | The `swanctl` command and the `/etc/swanctl/` directory |
-| `libcharon-extauth-plugins` | **EAP-MSCHAPv2** plugin (the client authentication method used in this guide) |
-| `libcharon-extra-plugins` | EAP-Identity and other plugins |
-| `libstrongswan-extra-plugins` | ChaCha20-Poly1305 and other algorithms |
-| `certbot` + `python3-certbot-dns-cloudflare` | ACME client and its Cloudflare DNS plugin |
+Credential files are root-owned with mode `0600`. Do not publish them in Git, on a web server, or to other users. Give each user only their own profile. Passwords are not printed to the terminal, and the installer does not start a public profile-download service.
 
-> **Do not install the `strongswan` metapackage.** It pulls in the legacy `strongswan-starter` (`ipsec.conf` / the `ipsec` command), which is an alternative to `charon-systemd`; having both installed causes conflicts.
-
-Confirm that only the `charon-systemd` stack is installed:
+`/tmp/usr.txt` may disappear after reboot or system cleanup. Accounts remain in `/var/lib/ikev2-vpn/state.json`. Regenerate the summary and profiles without entering the token:
 
 ```sh
-dpkg -l | grep -E 'strongswan|charon'
-systemctl cat strongswan.service | head -3
+python3 /usr/local/lib/ikev2-vpn/vpn.py --export
 ```
 
-> Ubuntu's official certbot documentation recommends installing via snap; this guide uses the apt version instead. The apt version ships with `certbot.timer` and renews automatically.
+Reruns for the same domain ask only for domain/token and preserve accounts, identifiers, profiles and distributed passwords. Use this to update the token. Changing domains is rejected and requires a migration. Do not delete state as a repair step.
 
-## 4. Obtain a Certificate with certbot
+## 5. Install and connect on iPhone 18 Pro Max
 
-### 4.1 Save the Cloudflare credentials
+Profiles use Apple's standard `com.apple.vpn.managed` **IKEv2** payload for modern iOS versions supporting these fields. The full-tunnel settings require iOS 14.2 or later. The iPhone 18 Pro Max uses the standard built-in VPN client; there is no model-specific profile format or third-party VPN app requirement. Physical-device validation remains necessary as described below.
+
+1. Download the user's `.mobileconfig` through SCP/SFTP to a trusted computer. Transfer it to the corresponding iPhone using AirDrop, trusted device management, or another secure channel.
+2. Open the file on iPhone. Install it in Settings > Profile Downloaded or Settings > General > VPN & Device Management. iOS requires device authentication and installation confirmation.
+3. Enable the configuration in Settings > VPN. Server, remote identity and credentials are already populated.
+4. Check the public IP in a browser after connecting; it should show the VPS exit address. Check DNS and IPv6 routing as well.
+
+The server cannot replace the user's profile-installation and VPN-enable actions. Profiles are **unsigned XML plists**, so iOS may label them unsigned. Profile signing and server certificate trust are separate. No CA, client certificate, MDM enrollment, or device supervision is installed.
+
+`AuthenticationMethod=None` with `ExtendedAuthEnabled=1` selects EAP username/password authentication. `RemoteIdentifier` and the public CA chain validate server identity. **Password authentication does not disable server certificate validation.**
+
+IKE and ESP use AES-256/SHA-256 with DH group 14, explicitly matched between the server and Apple profile. Profiles enable MOBIKE, PFS, and `IncludeAllNetworks`, disable local-network bypass, and request `0.0.0.0/0, ::/0` traffic selectors. Apple still excludes certain system traffic, such as DHCP, captive-network login, some cellular services, and companion-device communication. This is not a supervised Always On VPN. Traffic is not protected after the user disables the VPN.
+
+Client pools are `10.10.10.0/24` and `fd10:10:10::/64`, using NAT44 and NAT66. Without a public IPv6 uplink, client IPv6 stays within the tunnel but cannot reach the IPv6 internet; it is not deliberately sent through the local network. Choose an IPv6-capable VPS if IPv6 internet access is required.
+
+## 6. Certificate checks, renewal, and hot reload
+
+The installer uses the production Let's Encrypt ACME service with certbot and Cloudflare **DNS-01**. CA, TLS, and package-signature verification remain enabled.
+
+- Initial deployment issues a certificate. Existing certificates are reused or renewed according to certbot's expiration policy, without forcing issuance on every installation.
+- `ikev2-vpn-renew.timer` runs twice daily, with up to one hour of randomized delay and persistent catch-up after missed runs.
+- Each run checks expiration with OpenSSL. Missing or expired certificates trigger immediate issuance. Valid certificates go through `certbot renew`, allowing certbot to decide when renewal is due instead of hardcoding certificate lifetimes.
+- Successful issuance invokes the deploy hook. The scheduled check also redeploys the current valid certificate to recover from a previous deployment failure.
+- Before deployment, the hook checks expiration, domain, key matching, and intermediate certificate syntax. Files go into `/etc/swanctl/x509/`, `private/`, and `x509ca/`.
+- A running daemon reloads credentials with `swanctl --load-creds --noprompt`, without restarting VPN sessions. Reload failures are returned as failures.
+- Unrelated certificate lineages are ignored by the hook. The dedicated host must not already manage certbot certificates for other domains. After installation, the default `certbot.timer` is disabled in favour of the hardened renewal service, avoiding an additional unsandboxed timer entry point.
 
 ```sh
-install -m 600 /dev/null /etc/letsencrypt/cloudflare.ini
-nano /etc/letsencrypt/cloudflare.ini
+systemctl list-timers ikev2-vpn-renew.timer
+systemctl start ikev2-vpn-renew.service
+journalctl -u ikev2-vpn-renew.service -n 100 --no-pager
+openssl x509 -in /etc/swanctl/x509/vpn-server.pem -noout -dates -subject
 ```
 
-Contents (see [`config/cloudflare.ini.example`](config/cloudflare.ini.example)):
+Keep the token valid. Unreachable APIs, expired token permissions, and DNS propagation failures can prevent renewal. Email-free ACME registration provides no CA email notifications, so monitor service failures. Avoid deleting certbot state or repeatedly forcing renewal; CA rate limits still apply.
 
-```ini
-# API Token (recommended)
-dns_cloudflare_api_token = your_api_token
-```
+## 7. Services, files, and troubleshooting
 
-If you only have a Global API Key, use this instead (the token and the two lines below **must not appear together**, or certbot will report an error):
-
-```ini
-dns_cloudflare_email = your_cloudflare_login_email
-dns_cloudflare_api_key = your_global_api_key
-```
-
-The permissions must be 600, otherwise certbot warns "Unsafe permissions on credentials configuration file":
+| Location | Purpose |
+| --- | --- |
+| `/usr/local/lib/ikev2-vpn/` | Installed state/configuration and certificate tools, independent of the checkout |
+| `/etc/letsencrypt/renewal-hooks/deploy/ikev2-vpn` | Certificate deployment and credential hot reload |
+| `/etc/ikev2-vpn/firewall.nft` | Firewall with detected SSH ports substituted |
+| `/etc/sysctl.d/99-ikev2-vpn.conf` | IP forwarding and IPv6 RA settings |
+| `strongswan.service` | IKEv2 daemon, loading connections, accounts, and certificates at startup |
+| `ikev2-vpn-firewall.service` | The three managed nftables tables, started before strongSwan |
+| `ikev2-vpn-renew.service/.timer` | Certificate checks, renewal, deployment, and reload |
 
 ```sh
-chmod 600 /etc/letsencrypt/cloudflare.ini
-ls -l /etc/letsencrypt/cloudflare.ini
-```
-
-### 4.2 Install the deploy hook
-
-strongSwan does not read the files under `/etc/letsencrypt/live/`; the certificate has to be installed into `/etc/swanctl/`. We use certbot's **deploy hook**, which runs automatically after every **successful issuance or renewal**.
-
-```sh
-install -m 755 config/certbot-deploy-hook.sh /etc/letsencrypt/renewal-hooks/deploy/strongswan.sh
-```
-
-(If you haven't cloned this repository, paste the contents of [`config/certbot-deploy-hook.sh`](config/certbot-deploy-hook.sh) into that file manually.)
-
-What the script does:
-
-- `cert.pem` (leaf certificate) -> `/etc/swanctl/x509/vpn-server.pem`
-- `privkey.pem` -> `/etc/swanctl/private/vpn-server.key` (mode 600)
-- `chain.pem` (intermediate certificates) is split into one file per certificate -> `/etc/swanctl/x509ca/letsencrypt-chain-N.pem`. strongSwan reads only the first certificate in each file, so `fullchain.pem` cannot be used directly. The server must send the intermediate certificates to clients during the handshake, otherwise some clients will report "certificate not trusted".
-- Runs `swanctl --load-creds` to hot-reload the certificate **without disconnecting connected clients**.
-
-### 4.3 Do a dry run first
-
-```sh
-certbot certonly \
-    --dns-cloudflare \
-    --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
-    --dns-cloudflare-propagation-seconds 30 \
-    -d vpn.example.com \
-    --key-type ecdsa \
-    --dry-run
-```
-
-`--dry-run` uses Let's Encrypt's staging environment, which does not count against the production rate limits and does not trigger the deploy hook. The first time you run certbot, it will ask for an email address and for you to agree to the terms of service.
-
-### 4.4 Request the real certificate
-
-Remove `--dry-run`:
-
-```sh
-certbot certonly \
-    --dns-cloudflare \
-    --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
-    --dns-cloudflare-propagation-seconds 30 \
-    -d vpn.example.com \
-    --key-type ecdsa
-```
-
-- `--key-type ecdsa`: an ECDSA certificate (smaller and faster to handshake), supported by all mainstream IKEv2 clients. If you need RSA, change it to `--key-type rsa`; the remaining steps are the same.
-- For a wildcard domain (`*.example.com`), also add `-d '*.example.com'`; DNS-01 is the only way to get a wildcard certificate.
-
-On success the deploy hook runs automatically (strongSwan isn't running yet at this point, so the hook's `swanctl --load-creds` will fail; the script already ignores that failure). Check:
-
-```sh
-ls -l /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private
-```
-
-You should see `vpn-server.pem`, `letsencrypt-chain-1.pem` and `vpn-server.key`.
-
-### 4.5 Confirm automatic renewal
-
-```sh
-systemctl list-timers certbot.timer     # enabled by default for the apt certbot on Debian/Ubuntu
-certbot renew --dry-run                 # simulate a renewal to verify the credentials and the process work
-```
-
-Certificates are valid for 90 days, and certbot only actually renews once fewer than 30 days remain. After a successful renewal, the hook installs the new certificate into strongSwan again.
-
-## 5. Configure strongSwan
-
-`/etc/swanctl/swanctl.conf` already ends with `include conf.d/*.conf`, so we put our configuration in `conf.d/` and leave the main file untouched.
-
-### 5.1 Connection and address pools
-
-```sh
-install -m 644 config/ikev2-eap.conf /etc/swanctl/conf.d/ikev2-eap.conf
-sed -i 's/vpn\.example\.com/vpn.yourdomain.com/' /etc/swanctl/conf.d/ikev2-eap.conf
-```
-
-Key points (see the comments in the file for details):
-
-- `local { auth = pubkey; certs = vpn-server.pem; id = <your domain> }`: the server authenticates itself with the certificate. `id` must match the domain in the certificate (SAN); clients verify the server against it.
-- `remote { auth = eap-mschapv2; eap_id = %any }`: clients log in with a username and password.
-- `pools = vpn4, vpn6`: assigns clients a virtual IP and DNS servers from the address pools.
-- `local_ts = 0.0.0.0/0, ::/0`: all traffic goes through the VPN.
-- `esp_proposals` / `proposals` are omitted, so strongSwan's **default cipher suites** are used. They are maintained by strongSwan from release to release, which is safer than a long hand-written `ike=` / `esp=` list.
-
-> **No IPv6?** Remove the `vpn6` pool from `ikev2-eap.conf`, the `, vpn6` from the `pools` line, the `, ::/0` from `local_ts`, and the IPv6-related lines in [`nftables-vpn.conf`](config/nftables-vpn.conf).
-
-### 5.2 User accounts
-
-```sh
-install -m 600 config/secrets.conf.example /etc/swanctl/conf.d/secrets.conf
-nano /etc/swanctl/conf.d/secrets.conf
-```
-
-```
-secrets {
-    eap-alice {
-        id = alice
-        secret = "a long random password"
-    }
-}
-```
-
-- The section name (`eap-alice`) is just a label; **`id` is the username the client enters**.
-- Generate passwords with `openssl rand -base64 18`. The file contains plaintext passwords, so make sure it stays mode 600 and owned by root.
-
-## 6. Kernel Parameters and Firewall
-
-### 6.1 Enable forwarding
-
-```sh
-install -m 644 config/99-vpn-sysctl.conf /etc/sysctl.d/99-vpn.conf
-sysctl --system
-sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding
-```
-
-**IPv6 note**: once IPv6 forwarding is enabled, Linux ignores Router Advertisements (RA) by default, and the VPS may lose its IPv6 default route as a result. The config already sets `accept_ra = 2`, but `accept_ra` applies per interface, so check it against your actual interface:
-
-```sh
-ip -6 route show default                 # a default route should still be present
-ip -br link                              # find the interface name, e.g. eth0 / ens3
-sysctl net.ipv6.conf.eth0.accept_ra      # should be 2; if not, set it manually and add it to /etc/sysctl.d/99-vpn.conf
-```
-
-If you only use IPv4, you can delete the IPv6 lines.
-
-### 6.2 Firewall (nftables)
-
-Three things are needed: allow UDP 500/4500, allow forwarding of traffic from the VPN pools, and NAT (masquerade) outbound traffic.
-
-**Scenario A: a fresh VPS with no firewall rules at all** -- use the complete ruleset from this repository:
-
-```sh
-# Edit it first and make sure the SSH port (default 22) is correct, or you will lock yourself out!
-nano config/nftables-vpn.conf
-nft -c -f config/nftables-vpn.conf       # syntax check only; nothing is applied
-install -m 644 config/nftables-vpn.conf /etc/nftables.conf
-systemctl enable --now nftables
+systemctl status strongswan ikev2-vpn-firewall ikev2-vpn-renew.timer --no-pager
+swanctl --list-conns
+swanctl --list-pools
+swanctl --list-certs
+swanctl --list-sas
+journalctl -u strongswan -n 100 --no-pager
 nft list ruleset
 ```
 
-> Have your cloud provider's VNC / web console ready before doing this, in case a rule mistake cuts off your connection. `nftables.service` loads `/etc/nftables.conf` at boot.
+| Symptom | Check |
+| --- | --- |
+| Cloudflare 401/403 or zone not found | Zone Read and DNS Edit permissions for the correct active zone |
+| DNS-01 validation fails | Authoritative Cloudflare nameservers, DNSSEC/CAA, token validity; increase the 60-second propagation wait if needed |
+| Certificate succeeds but iPhone cannot connect | Check domain resolution to the VPS, DNS-only status and inbound UDP 500/4500 |
+| Authentication fails | The correct user's current profile, persistent account state, and strongSwan logs |
+| Connected without internet | Forwarding, default routes, firewall, CHILD_SA, and upstream network; IKE_SA alone does not establish a working data plane |
+| Large pages or network switching stall | MTU/MSS and blocked UDP; MSS clamping precedes accepting firewall rules |
+| SSH is blocked | Recover through the cloud console; check SSH ports in the managed firewall, validate with `nft -c -f`, then restart its service |
+| IPv6 default route disappears after reboot | Actual interface `accept_ra=2`, provider configuration, and the IPv6 default route |
 
-**Scenario B: you already have a firewall (ufw / your own nftables / iptables)** -- don't overwrite it; merge only:
+There is no automatic uninstall. Reverse firewall and forwarding changes according to the server's networking requirements. Back up account state, the token, ACME data, and profiles securely with encryption.
 
-- Allow inbound UDP 500 and UDP 4500;
-- Allow forwarding from `10.10.10.0/24` and `fd10:10:10::/64`;
-- Add the NAT rules from the last two `table ... vpn_nat` blocks of `config/nftables-vpn.conf` (or the equivalent iptables `-t nat ... MASQUERADE`);
-- If you use ufw, also change `DEFAULT_FORWARD_POLICY` to `ACCEPT` in `/etc/default/ufw`, and put the NAT rules in `/etc/ufw/before.rules`.
+## 8. File permissions and systemd hardening
 
-The NAT rules are not tied to an interface name (they only match the source address pools), so nothing needs changing whatever your interface is called.
+Credentials are not passed in command arguments. Tokens, account state, summaries, private keys, and profiles are root-owned with mode `0600`; persistent account and profile directories use `0700`. The server installs distribution packages rather than executing third-party remote installation scripts.
 
-## 7. Start and Verify
+`config/strongswan-hardening.conf` and `config/renew-hardening.conf` are installed as systemd drop-ins:
 
-```sh
-systemctl enable --now strongswan
-systemctl status strongswan --no-pager
-```
+| Restriction | strongSwan | Certificate checks and renewal |
+| --- | --- | --- |
+| Privilege escalation | NoNewPrivileges; only NET_ADMIN, NET_BIND_SERVICE, NET_RAW capabilities | NoNewPrivileges; empty capability set |
+| Writes | Read-only system, writable `/run` | Certificate/credential directories, certbot work/log directories, and the certificate lock file only |
+| Sensitive files | Cloudflare/ACME data, persistent account backups, and profiles hidden | Additional account backups and profiles hidden |
+| System control | systemd private control socket and system D-Bus hidden | Same; the hook reloads directly through VICI |
+| Devices and kernel | Private devices, protected tunables/modules/control groups/kernel logs | Same |
+| Other | Private temporary directory; protected home directories; restricted address families, namespaces, setuid, and realtime scheduling; no writable executable memory | Similar restrictions, with memory behaviour needed by certbot/Python allowed |
 
-After `strongswan.service` starts, it automatically runs `swanctl --load-all`, which loads all the connections, address pools, certificates and passwords from `conf.d/`.
+Before allowing client forwarding, the firewall checks the IPsec decryption marker rather than trusting only source IPs. VPN clients cannot access host services such as SSH, other VPN users, common private/link-local networks, or cloud metadata endpoints. This version is not intended for corporate private-network access.
 
-Check what was loaded:
+These measures limit some consequences of a service compromise; they do not contain a host-root or kernel compromise. strongSwan needs `CAP_NET_ADMIN` to install IPsec policies, which carries network-management risk. Renewal needs access to the token and private key. Host-root or kernel control can bypass restrictions and expose credentials. Scope the Cloudflare token to the required zone to limit DNS impact if it leaks.
 
-```sh
-swanctl --list-certs        # should show vpn-server.pem (subject is your domain) and the intermediate certificate
-swanctl --list-conns        # should show ikev2-eap
-swanctl --list-pools        # should show vpn4 / vpn6
-journalctl -u strongswan -n 50 --no-pager
-```
-
-To reload the configuration manually (after editing `conf.d`):
-
-```sh
-swanctl --load-all
-```
-
-Once a client has connected:
+Check accepted and effective settings on the actual VPS:
 
 ```sh
-swanctl --list-sas          # established connections, including usernames and assigned virtual IPs
+systemctl cat strongswan ikev2-vpn-renew
+systemctl show strongswan -p NoNewPrivileges -p CapabilityBoundingSet -p ProtectSystem
+systemd-analyze security strongswan.service ikev2-vpn-renew.service
 ```
 
-## 8. Client Configuration
+## 9. Development and validation limits
 
-Settings common to all clients:
-
-| Setting | Value |
-|---|---|
-| Server / Server address | `vpn.example.com` (use the domain name, not the IP, or certificate validation will fail) |
-| Remote ID | `vpn.example.com` (same as the server's `id`) |
-| Authentication method | Username + password (EAP / IKEv2 EAP) |
-| Username / Password | The `id` / `secret` from step 5.2 |
-| Local ID | Leave empty |
-
-Because the certificate is issued by Let's Encrypt, whose root certificate the operating system already trusts, **clients do not need to import any certificates**.
-
-- **iOS / iPadOS / macOS**: Settings -> VPN -> Add VPN Configuration -> Type **IKEv2**; fill in Server and Remote ID, set User Authentication to "Username", and enter the username and password. See [strongSwan's notes on Apple clients](https://wiki.strongswan.org/projects/strongswan/wiki/AppleClients).
-- **Windows 10 / 11**: Settings -> Network & Internet -> VPN -> Add VPN; set VPN provider to "Windows (built-in)", VPN type to **IKEv2**, and Type of sign-in info to "User name and password". See [strongSwan's notes on Windows](https://wiki.strongswan.org/projects/strongswan/wiki/Windows7#C).
-  - If connecting fails with "IKE authentication credentials are unacceptable" / "policy match error", it's usually because the built-in client's default crypto parameters (older Windows versions default to weak DH groups) don't match the server's default suites. Use `Set-VpnConnectionIPsecConfiguration` in PowerShell to specify modern parameters such as `AES256`, `SHA256`, `Group14`/`ECP256`. Enabling weak algorithms on the server to work around this is not recommended.
-- **Android**: install **strongSwan VPN Client** from Google Play, create a new profile with type **IKEv2 EAP (Username/Password)**, and fill in the server domain, username and password; leave the CA certificate on "Select automatically". See [the Android client notes](https://wiki.strongswan.org/projects/strongswan/wiki/AndroidVPNClient).
-- **Linux**: the same packages + [`config/client-linux.conf`](config/client-linux.conf):
+Python unit tests use only the standard library and do not contact Cloudflare or ACME:
 
 ```sh
-apt install -y strongswan-swanctl charon-systemd libcharon-extra-plugins libcharon-extauth-plugins
-# Make strongSwan trust the Let's Encrypt root certificates (already in the system certificate store)
-cp /etc/ssl/certs/ISRG_Root_X1.pem /etc/ssl/certs/ISRG_Root_X2.pem /etc/swanctl/x509ca/
-install -m 600 config/client-linux.conf /etc/swanctl/conf.d/vpn-client.conf
-nano /etc/swanctl/conf.d/vpn-client.conf          # change the domain, username and password
-systemctl restart strongswan
-swanctl --initiate --child net                    # connect
-swanctl --list-sas
-swanctl --terminate --ike vpn                     # disconnect
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-  If a Linux client stalls on large packets (MTU), set `mtu = 1280` in `/etc/strongswan.d/charon/kernel-netlink.conf`.
+Run `tests/integration.sh` **only as root in a disposable container**. It writes to `/etc`, generates test CA/certificate fixtures, starts real charon, and applies firewall rules within the container network namespace. It requires the documented Debian packages plus `shellcheck` and the NET_ADMIN capability. It checks accounts and profiles, standalone extraction, repeatability, key mismatch rejection, hot reload, expired-certificate handling, and repeated firewall application. Renewal uses a mocked certbot command, not public CA issuance.
 
-Once connected, visit a site such as <https://ifconfig.me> from the client; it should show the VPS's IP.
-
-## 9. Routine Maintenance
-
-**Adding / removing users**: edit `/etc/swanctl/conf.d/secrets.conf`, then
+Build and run the supplied development image from the repository root. CA trust is mounted during the build rather than retained as a proxy-specific image layer; TLS and apt signature verification remain enabled.
 
 ```sh
-swanctl --load-creds
+docker build -f tests/Dockerfile \
+  --secret id=proxy_ca,src=/etc/ssl/certs/ca-certificates.crt \
+  -t ikev2-vpn-test:local .
+docker run --rm --cap-drop ALL \
+  --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE --cap-add NET_RAW \
+  --security-opt no-new-privileges \
+  ikev2-vpn-test:local bash /repo/tests/integration.sh
 ```
 
-Users who are already online are not disconnected; to kick someone, use `swanctl --terminate --ike ikev2-eap --ike-id <number>` (the number is shown by `--list-sas`). By default, the same account can be online from multiple devices at once.
+Tests include static validation of systemd units/drop-ins and real daemon startup with reduced capabilities. The container does not run full systemd, so its sandbox and boot behaviour are not fully verified. Validation does not cover a real VPS installation/reboot, live Cloudflare writes and Let's Encrypt issuance, physical iPhone 18 Pro Max installation/connection, or end-to-end internet ESP/NAT traffic. Profiles follow the [official Apple device-management schema](https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.vpn.managed.yaml); parsing a plist does not establish physical-device compatibility.
 
-**Certificate renewal**: fully automatic. When troubleshooting, check `journalctl -u certbot` or `/var/log/letsencrypt/letsencrypt.log`. To force-test the whole chain:
+The daemon test also enforces the configured socket address families using libseccomp. Distribution plugins need `AF_PACKET` for ARP/packet sockets and `AF_ALG` for kernel cryptography; both are allowed. This does not emulate all systemd sandbox settings.
 
-```sh
-certbot renew --force-renewal --deploy-hook /etc/letsencrypt/renewal-hooks/deploy/strongswan.sh
-```
+## 10. Project history
 
-(Note that repeatedly forcing renewals in production within a short period will hit Let's Encrypt's rate limits; for routine checks, `certbot renew --dry-run` is enough.)
-
-**Upgrades**: `apt update && apt upgrade`; strongSwan security updates are delivered through the distribution. After upgrading, run `systemctl status strongswan` to confirm the service is healthy.
-
-**Log level**: when you need more detailed IKE logs, edit `/etc/strongswan.d/charon-systemd.conf`, set the levels in the `journal { }` section, then run `systemctl restart strongswan`. Remember to change them back after debugging.
-
-```
-charon-systemd {
-    journal {
-        default = 1
-        ike = 2
-    }
-}
-```
-
-## 10. Troubleshooting
-
-| Symptom | What to check |
-|---|---|
-| certbot reports `Unsafe permissions` | `chmod 600 /etc/letsencrypt/cloudflare.ini` |
-| certbot reports a Cloudflare authentication error / can't find the zone | The token's permissions must include **DNS:Edit** on the domain's zone; don't mix the token with email/api_key |
-| certbot validation times out | Increase `--dns-cloudflare-propagation-seconds` (e.g. to 60) |
-| `swanctl: connecting to 'unix:///var/run/charon.vici' failed` | The daemon isn't running: `systemctl status strongswan` |
-| `loading EAP_MSCHAPV2 method failed` / no eap-mschapv2 in the logs | `libcharon-extauth-plugins` is not installed |
-| Logs show `no EAP key found` / login fails | The `id` in `secrets.conf` doesn't match the client's username, or `swanctl --load-creds` wasn't run |
-| Client says the certificate is invalid / server identity can't be verified | The client must use the domain name, not the IP; confirm the intermediate certificate appears in `swanctl --list-certs`; check the server's clock |
-| Client can't connect and the server logs show no requests at all | The cloud security group / firewall doesn't allow UDP 500 and 4500; the domain doesn't resolve to this machine; the Cloudflare record is set to "Proxied" |
-| Connected but no internet access | Check that `sysctl net.ipv4.ip_forward` is 1 and that the NAT and forward rules exist in `nft list ruleset` |
-| IPv6 doesn't work / the server lost its own IPv6 | See 6.1: check `accept_ra` and the default route, or simply remove the IPv6 pool |
-| Large pages won't load, or speeds are abnormally slow | MTU/MSS issue: confirm the MSS clamping rule exists in nftables; set `mtu = 1280` on Linux clients |
-| Loading certificates is denied on Ubuntu | `dmesg \| grep -i apparmor`; `charon-systemd` / `swanctl` ship AppArmor profiles that allow reading `/etc/swanctl/`; if you changed the paths, adjust the profiles to match |
-
-## 11. What This Guide Has Been Verified Against
-
-An honest account, so you can judge what needs to be double-checked on your own machine:
-
-**Actually verified** (in an Ubuntu 24.04 environment with strongSwan 5.9.13, certbot 5.8 + certbot-dns-cloudflare):
-
-- Package names and splits: `eap-mschapv2` is in `libcharon-extauth-plugins`, `eap-identity` is in `libcharon-extra-plugins`; `strongswan.service` comes from `charon-systemd`, and its `ExecStartPost` automatically runs `swanctl --load-all`; `swanctl.conf` ships with `include conf.d/*.conf`.
-- `ikev2-eap.conf`, `secrets.conf.example` and the deploy hook from `config/` were actually loaded: the connection, both address pools, the certificate, the private key and the EAP passwords all loaded successfully.
-- A complete IKE handshake succeeded using a test CA (root -> intermediate -> ECDSA leaf): the client validated the server's certificate chain, **EAP-MSCHAPv2 authentication succeeded**, and the server assigned `10.10.10.x` / `fd10:10:10::x` virtual IPs and DNS servers.
-- Under certbot's `RENEWED_LINEAGE` convention, the deploy hook correctly split and installed the leaf certificate, private key and intermediate certificates.
-- `nftables-vpn.conf` passes the `nft -c` syntax check; the certbot-dns-cloudflare credential format and command-line option names are taken from the plugin's bundled documentation.
-
-**Not verified** (due to limitations of the test environment; keep an eye on these after deploying):
-
-- Real installs on Debian 13 and Ubuntu 26.04: it was only confirmed from package indexes and public information that Ubuntu 26.04 ships strongSwan 6.0.x and that both systems use the same package names and splits; nothing was actually installed and run. The parts of the `swanctl.conf` syntax used in this guide are the same in strongSwan 6 and 5.9, but treat the output of `swanctl --load-all` on your actual machine as authoritative.
-- Real Let's Encrypt issuance (requires your Cloudflare account).
-- The ESP data plane, forwarding, NAT, and nftables actually taking effect: the test environment's kernel has no ESP support, so a CHILD_SA could not be established.
-- The actual connection UI of each client platform; the descriptions are based on common practice, and UI labels may change between OS versions.
-- The official strongSwan documentation site (docs.strongswan.org) and certbot's online documentation were not reachable from this environment; the configuration above is based on the configuration templates shipped with the distribution packages, the plugins' bundled documentation, and observed behavior.
+This version adds two-input deployment, two random EAP accounts, Apple profiles, repeatability and certificate lifecycle management. It retains IKEv2, public CA server certificates, password authentication and full-tunnel VPN. Legacy account/client examples in `config/` are manual references; automation uses `scripts/vpn.py` and does not load example passwords.

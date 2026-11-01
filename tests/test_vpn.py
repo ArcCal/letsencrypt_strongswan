@@ -1,0 +1,109 @@
+import importlib.util
+import json
+from pathlib import Path
+import plistlib
+import re
+import string
+import tempfile
+import unittest
+
+spec = importlib.util.spec_from_file_location('vpn', Path(__file__).resolve().parents[1] / 'scripts/vpn.py')
+vpn = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(vpn)
+
+
+class DeploymentTests(unittest.TestCase):
+    def test_random_accounts_character_classes(self):
+        users = [vpn.account() for _ in range(200)]
+        self.assertEqual(len({u['username'] for u in users}), len(users))
+        self.assertEqual(len({u['password'] for u in users}), len(users))
+        for u in users:
+            self.assertRegex(u['username'], r'^[A-Za-z0-9]{8}$')
+            self.assertEqual(len(u['password']), 22)
+            for field in ('username', 'password'):
+                for group in (string.ascii_lowercase, string.ascii_uppercase, string.digits):
+                    self.assertTrue(set(u[field]) & set(group))
+            self.assertTrue(set(u['password']) & set(vpn.SYMBOLS))
+
+    def test_repeated_install_preserves_accounts_and_profile_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / 'var/lib/ikev2-vpn'
+            initial = vpn.load_state(state, 'vpn.example.com')
+            vpn.render(initial, root)
+            profiles = {p.name: p.read_bytes() for p in (state / 'profiles').glob('*')}
+            again = vpn.load_state(state, 'vpn.example.com')
+            vpn.render(again, root)
+            self.assertEqual(initial, again)
+            self.assertEqual(profiles, {p.name: p.read_bytes() for p in (state / 'profiles').glob('*')})
+            with self.assertRaises(ValueError):
+                vpn.load_state(state, 'other.example.com')
+            for path in [state / 'state.json', root / 'tmp/usr.txt',
+                         root / 'etc/swanctl/conf.d/ikev2-vpn.conf', *(state / 'profiles').glob('*')]:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_profiles_match_server_credentials_and_full_tunnel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = vpn.load_state(root / 'var/lib/ikev2-vpn', 'vpn.example.com')
+            vpn.render(data, root)
+            server = (root / 'etc/swanctl/conf.d/ikev2-vpn.conf').read_text()
+            summary = (root / 'tmp/usr.txt').read_text()
+            for u in data['users']:
+                profile = plistlib.loads((root / f"var/lib/ikev2-vpn/profiles/{u['username']}.mobileconfig").read_bytes())
+                self.assertEqual(len(profile['PayloadContent']), 1)  # No client or CA certificate payload.
+                payload = profile['PayloadContent'][0]
+                self.assertEqual(payload['VPNType'], 'IKEv2')
+                ike = payload['IKEv2']
+                self.assertEqual(ike['AuthName'], u['username'])
+                self.assertEqual(ike['AuthPassword'], u['password'])
+                self.assertEqual(ike['AuthenticationMethod'], 'None')
+                self.assertEqual(ike['ExtendedAuthEnabled'], 1)
+                self.assertEqual(ike['IncludeAllNetworks'], 1)
+                self.assertEqual(ike['ExcludeLocalNetworks'], 0)
+                self.assertEqual(ike['RemoteIdentifier'], data['domain'])
+                self.assertNotIn('PayloadCertificateUUID', ike)
+                self.assertIn(u['username'], server)
+                self.assertIn(u['password'], server)
+                self.assertIn(u['username'], summary)
+                self.assertIn(u['password'], summary)
+            self.assertIn('local_ts = 0.0.0.0/0, ::/0', server)
+
+    def test_export_replaces_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / 'important'
+            target.write_text('keep')
+            link = root / 'usr.txt'
+            link.symlink_to(target)
+            vpn.write_private(link, 'accounts')
+            self.assertEqual(target.read_text(), 'keep')
+            self.assertFalse(link.is_symlink())
+            self.assertEqual(link.read_text(), 'accounts')
+
+    def test_invalid_domain_cannot_inject_configuration(self):
+        for name in ('https://vpn.example.com', '*.example.com', 'example.com\n}', '127.0.0.1', '-a.example.com', 'a..com'):
+            with self.assertRaises(ValueError):
+                vpn.domain_name(name)
+        self.assertEqual(vpn.domain_name('VPN.Example.com.'), 'vpn.example.com')
+
+    def test_dns_records_converge_and_remove_stale_ipv6(self):
+        class FakeCF(vpn.Cloudflare):
+            def __init__(self):
+                self.calls = []
+            def records(self, zone, domain):
+                return [{'type': t, 'id': str(i)} for i, t in enumerate(['A', 'A', 'AAAA', 'TXT'])]
+            def request(self, path, method='GET', data=None):
+                self.calls.append((path, method, data))
+        api = FakeCF()
+        api.point_dns('zone', 'vpn.example.com', '203.0.113.10', None)
+        self.assertEqual([c[1] for c in api.calls], ['PUT', 'DELETE', 'DELETE'])
+        self.assertFalse(api.calls[0][2]['proxied'])
+        self.assertFalse(any(c[0].endswith('/3') for c in api.calls))  # TXT preserved.
+        api.records = lambda *_: [{'type': 'CNAME'}]
+        with self.assertRaises(ValueError):
+            api.point_dns('zone', 'vpn.example.com', '203.0.113.10', None)
+
+
+if __name__ == '__main__':
+    unittest.main()

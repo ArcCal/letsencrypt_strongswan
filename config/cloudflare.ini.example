@@ -1,5 +1,6 @@
 # /etc/letsencrypt/cloudflare.ini   (chmod 600, owner root)
-# Recommended: a scoped API Token (Zone:DNS:Edit, limited to your domain's zone)
+# Manual reference only; install.sh writes this credential file from hidden input.
+# Scoped API Token: Zone:DNS:Edit + Zone:Zone:Read, limited to your domain's zone.
 dns_cloudflare_api_token = 0123456789abcdef0123456789abcdef01234567
 
 # Not recommended: Global API Key (permissions cover the entire account). If you use it, delete the token line above,
