@@ -29,7 +29,11 @@ mv -f "$STAGE/vpn-server.pem" "$SWANCTL/x509/vpn-server.pem"
 mv -f "$STAGE/vpn-server.key" "$SWANCTL/private/vpn-server.key"
 rm -f "$SWANCTL"/x509ca/letsencrypt-chain-*.pem
 mv "$STAGE"/letsencrypt-chain-*.pem "$SWANCTL/x509ca/"
-if [ -S /run/charon.vici ]; then
-    # Report reload errors; initial installation may precede daemon startup.
+if [ "${IKEV2_VPN_SKIP_RELOAD:-0}" = 1 ]; then
+    # Installation repairs the service next and requires a full credential load.
+    printf 'Certificate deployed; credential loading is deferred to service startup.\n'
+else
+    # A socket file may be stale. Let the real VICI request determine success.
+    # Scheduled renewal must report a stopped daemon or failed live reload.
     swanctl --load-creds --noprompt
 fi

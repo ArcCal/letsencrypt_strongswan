@@ -131,6 +131,7 @@ The installer uses the production Let's Encrypt ACME service with certbot and Cl
 - Successful issuance invokes the deploy hook. The scheduled check also redeploys the current valid certificate to recover from a previous deployment failure.
 - Before deployment, the hook checks expiration, domain, key matching, and intermediate certificate syntax. Files go into `/etc/swanctl/x509/`, `private/`, and `x509ca/`.
 - A running daemon reloads credentials with `swanctl --load-creds --noprompt`, without restarting VPN sessions. Reload failures are returned as failures.
+- During installation only, the hook deploys files without contacting VICI. The installer then repairs service settings, restarts strongSwan, and requires `swanctl --load-all` to succeed. This allows recovery from a crashed daemon with a stale socket. Scheduled renewal still requires a successful live credential reload and reports daemon/reload failures.
 - Unrelated certificate lineages are ignored by the hook. The dedicated host must not already manage certbot certificates for other domains. After installation, the default `certbot.timer` is disabled in favour of the hardened renewal service, avoiding an additional unsandboxed timer entry point.
 
 ```sh

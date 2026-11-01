@@ -65,7 +65,18 @@ cp /tmp/key1.pem "$LINEAGE/privkey.pem"
 cat /tmp/ca.pem /tmp/ca.pem > "$LINEAGE/chain.pem"
 export PATH=/test-bin:$PATH
 export RENEWED_LINEAGE=$LINEAGE
-sh config/certbot-deploy-hook.sh
+# Reproduce a crashed daemon: the filesystem socket remains but nobody listens.
+python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+    stale.bind('/run/charon.vici')
+PY
+if sh config/certbot-deploy-hook.sh > /tmp/stale-reload.log 2>&1; then
+    echo 'A stale socket was treated as a successful live reload' >&2
+    exit 1
+fi
+# Installer mode must deploy successfully before repairing/restarting the daemon.
+IKEV2_VPN_SKIP_RELOAD=1 sh config/certbot-deploy-hook.sh
 cmp "$LINEAGE/cert.pem" /etc/swanctl/x509/vpn-server.pem
 test "$(stat -c %a /etc/swanctl/private/vpn-server.key)" = 600
 test "$(find /etc/swanctl/x509ca -name 'letsencrypt-chain-*.pem' | wc -l)" = 2
@@ -77,7 +88,11 @@ cp /tmp/key1.pem "$LINEAGE/privkey.pem"
 python3 tests/restrict_address_families.py config/strongswan-hardening.conf /usr/sbin/charon-systemd >/tmp/charon.log 2>&1 &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
-for ((n=0; n<5; n++)); do test ! -S /var/run/charon.vici || break; sleep 1; done
+for ((n=0; n<10; n++)); do
+    if swanctl --stats > /tmp/readiness.log 2>&1; then break; fi
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then cat /tmp/charon.log; exit 1; fi
+    sleep 1
+done
 if ! swanctl --load-all --noprompt > /tmp/load.log 2>&1; then cat /tmp/load.log /tmp/charon.log; exit 1; fi
 grep 'successfully loaded 1 connections' /tmp/load.log
 grep 'successfully loaded 2 pools' /tmp/load.log

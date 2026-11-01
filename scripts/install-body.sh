@@ -78,6 +78,10 @@ install -d -m 700 /etc/swanctl/private
 install -m 700 "$REPO/config/certbot-deploy-hook.sh" /etc/letsencrypt/renewal-hooks/deploy/ikev2-vpn
 
 # Noninteractive registration deliberately has no email: documented in README.
+# Both certbot's directory hook and the explicit deployment below must work even
+# if a previous crash left a stale VICI socket. The mandatory service restart and
+# --load-all later in installation validate the running daemon with new settings.
+export IKEV2_VPN_SKIP_RELOAD=1
 certbot certonly --non-interactive --agree-tos --register-unsafely-without-email \
     --dns-cloudflare --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
     --dns-cloudflare-propagation-seconds 60 --preferred-challenges dns \
@@ -86,6 +90,7 @@ certbot certonly --non-interactive --agree-tos --register-unsafely-without-email
 openssl x509 -in "/etc/letsencrypt/live/$DOMAIN/cert.pem" -noout -checkend 0
 # Also deploy when certbot reuses an existing unexpired certificate.
 RENEWED_LINEAGE="/etc/letsencrypt/live/$DOMAIN" /etc/letsencrypt/renewal-hooks/deploy/ikev2-vpn
+unset IKEV2_VPN_SKIP_RELOAD
 flock -u 8
 
 install -m 644 "$REPO/config/99-vpn-sysctl.conf" /etc/sysctl.d/99-ikev2-vpn.conf
