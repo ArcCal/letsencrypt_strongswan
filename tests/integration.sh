@@ -96,6 +96,8 @@ done
 if ! swanctl --load-all --noprompt > /tmp/load.log 2>&1; then cat /tmp/load.log /tmp/charon.log; exit 1; fi
 grep 'successfully loaded 1 connections' /tmp/load.log
 grep 'successfully loaded 2 pools' /tmp/load.log
+swanctl --list-pools > /tmp/pools.log
+grep '172.29.240.1' /tmp/pools.log
 test "$(grep -c 'loaded eap secret' /tmp/load.log)" = 2
 swanctl --stats > /tmp/stats.log
 grep 'eap-mschapv2' /tmp/stats.log
@@ -152,4 +154,6 @@ nft -f /tmp/firewall.nft
 nft -f /tmp/firewall.nft
 nft list chain inet ikev2_vpn forward > /tmp/forward.log
 grep 'ipsec exists' /tmp/forward.log
+nft list chain ip ikev2_vpn_nat postrouting > /tmp/nat.log
+grep '172.29.240.0/24' /tmp/nat.log
 printf 'Integration checks passed (no public ACME or iPhone test performed).\n'

@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import ipaddress
 import json
 from pathlib import Path
 import plistlib
@@ -15,6 +16,32 @@ spec.loader.exec_module(vpn)
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_ipv4_pool_avoids_lan_and_matches_firewall(self):
+        lan = ipaddress.ip_network('10.10.0.0/16')
+        self.assertFalse(vpn.IPV4_POOL.overlaps(lan))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / 'var/lib/ikev2-vpn'
+            data = vpn.load_state(state, 'vpn.example.com')
+            data['server_address'] = '203.0.113.10'
+            vpn.write_private(state / 'state.json', json.dumps(data))
+            original_accounts = list(data['users'])
+            original_profiles = [vpn.profile(data['domain'], user, data['server_address'])
+                                 for user in data['users']]
+            # Reuse an existing account state while regenerating server settings.
+            vpn.render(vpn.load_state(state, data['domain']), root)
+            server = (root / 'etc/swanctl/conf.d/ikev2-vpn.conf').read_text()
+            pool = re.search(r'vpn4\s*\{\s*addrs\s*=\s*(\S+)', server).group(1)
+            self.assertEqual(ipaddress.ip_network(pool), vpn.IPV4_POOL)
+            self.assertFalse(ipaddress.ip_network(pool).overlaps(lan))
+            firewall = (Path(__file__).resolve().parents[1] / 'config/nftables-vpn.conf').read_text()
+            self.assertIn(f'ip saddr {pool} drop', firewall)
+            self.assertIn(f'ip saddr {pool} meta ipsec exists accept', firewall)
+            self.assertIn(f'ip saddr {pool} ip daddr != {pool} masquerade', firewall)
+            self.assertEqual(vpn.load_state(state, data['domain'])['users'], original_accounts)
+            for user, expected in zip(data['users'], original_profiles):
+                self.assertEqual((state / 'profiles' / (user['username'] + '.mobileconfig')).read_bytes(), expected)
+
     def test_public_ipv4_accepts_cloud_nat_external_address(self):
         # A GCE NIC may only have 10.x addresses; the external IP is cloud-side.
         with mock.patch.object(vpn.urllib.request, 'urlopen', return_value=io.BytesIO(b'8.8.4.4\n')) as request:

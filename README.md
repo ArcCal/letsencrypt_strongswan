@@ -119,7 +119,9 @@ The server cannot replace the user's profile-installation and VPN-enable actions
 
 IKE and ESP use AES-256/SHA-256 with DH group 14, explicitly matched between the server and Apple profile. Profiles enable MOBIKE, PFS, and `IncludeAllNetworks`, disable local-network bypass, and request `0.0.0.0/0, ::/0` traffic selectors. Apple still excludes certain system traffic, such as DHCP, captive-network login, some cellular services, and companion-device communication. This is not a supervised Always On VPN. Traffic is not protected after the user disables the VPN.
 
-Client pools are `10.10.10.0/24` and `fd10:10:10::/64`, using NAT44 and NAT66. Without a public IPv6 uplink, client IPv6 stays within the tunnel but cannot reach the IPv6 internet; it is not deliberately sent through the local network. Choose an IPv6-capable VPS if IPv6 internet access is required.
+Client pools are `172.29.240.0/24` and `fd10:10:10::/64`, using NAT44 and NAT66. Without a public IPv6 uplink, client IPv6 stays within the tunnel but cannot reach the IPv6 internet; it is not deliberately sent through the local network. Choose an IPv6-capable VPS if IPv6 internet access is required.
+
+The IPv4 pool is outside `10.10.0.0/16`. On an existing installation, rerun the updated installer to apply the pool, forwarding, and NAT settings together. Accounts and profile identities remain unchanged. Disconnect and reconnect clients to receive addresses from the new pool; reinstalling Apple profiles is not required because pool addresses are assigned by the server. No private subnet can avoid every possible client LAN, so check for overlap if using other local networks.
 
 ## 6. Certificate checks, renewal, and hot reload
 

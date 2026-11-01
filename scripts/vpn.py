@@ -17,6 +17,7 @@ import uuid
 
 STATE = Path('/var/lib/ikev2-vpn')
 SYMBOLS = '!@#%+-_=.:?'
+IPV4_POOL = ipaddress.IPv4Network('172.29.240.0/24')
 
 
 def write_private(path, data, mode=0o600):
@@ -149,7 +150,7 @@ connections {{
 }}
 pools {{
     vpn4 {{
-        addrs = 10.10.10.0/24
+        addrs = {IPV4_POOL}
         dns = 1.1.1.1, 1.0.0.1
     }}
     vpn6 {{
