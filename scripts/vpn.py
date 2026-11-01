@@ -84,7 +84,7 @@ def load_state(root, domain):
     return data
 
 
-def profile(domain, user):
+def profile(domain, user, address):
     name = user['username']
     identifier = 'org.ikev2-vpn.' + domain + '.' + name
     sa = {'EncryptionAlgorithm': 'AES-256', 'IntegrityAlgorithm': 'SHA2-256',
@@ -95,7 +95,7 @@ def profile(domain, user):
         'PayloadDisplayName': domain + ' (' + name + ')', 'UserDefinedName': domain + ' (' + name + ')',
         'VPNType': 'IKEv2', 'IPv4': {'OverridePrimary': 1},
         'IKEv2': {
-            'RemoteAddress': domain, 'RemoteIdentifier': domain, 'LocalIdentifier': name,
+            'RemoteAddress': address, 'RemoteIdentifier': domain, 'LocalIdentifier': name,
             'AuthenticationMethod': 'None', 'ExtendedAuthEnabled': 1,
             'AuthName': name, 'AuthPassword': user['password'],
             'ServerCertificateCommonName': domain, 'DeadPeerDetectionRate': 'Medium',
@@ -116,6 +116,7 @@ def profile(domain, user):
 
 def render(data, root=Path('/')):
     domain = data['domain']
+    address = str(ipaddress.ip_address(data['server_address']))
     (root / 'var/lib/ikev2-vpn/profiles').mkdir(parents=True, exist_ok=True, mode=0o700)
     text = f'''# Managed by ikev2-vpn. Do not put other VPN connections in this file.
 connections {{
@@ -159,11 +160,11 @@ pools {{
 }}
 secrets {{
 '''
-    output = ['Server: ' + domain]
+    output = ['Server IP: ' + address, 'Certificate domain / Remote ID: ' + domain]
     for user in data['users']:
         name, password = user['username'], user['password']
         text += f'    eap-{name} {{\n        id = {name}\n        secret = "{password}"\n    }}\n'
-        write_private(root / f'var/lib/ikev2-vpn/profiles/{name}.mobileconfig', profile(domain, user))
+        write_private(root / f'var/lib/ikev2-vpn/profiles/{name}.mobileconfig', profile(domain, user, address))
         output.extend(['', 'Username: ' + name, 'Password: ' + password,
                        'Profile: /var/lib/ikev2-vpn/profiles/' + name + '.mobileconfig'])
     write_private(root / 'etc/swanctl/conf.d/ikev2-vpn.conf', text + '}\n')
@@ -197,38 +198,10 @@ class Cloudflare:
                 return rows[0]['id']
         raise ValueError('No active Cloudflare zone found for this domain; Zone:Read and DNS:Edit are required')
 
-    def records(self, zone, domain):
-        rows, page = [], 1
-        while True:
-            batch = self.request(f'zones/{zone}/dns_records?' + urllib.parse.urlencode(
-                {'name': domain, 'per_page': 100, 'page': page}))
-            rows.extend(batch)
-            if len(batch) < 100:
-                return rows
-            page += 1
-
-    def point_dns(self, zone, domain, ipv4, ipv6):
-        rows = self.records(zone, domain)
-        if any(row['type'] == 'CNAME' for row in rows):
-            raise ValueError('The VPN domain already has a CNAME; use a dedicated VPN domain without a CNAME')
-        for kind, address in [('A', ipv4), ('AAAA', ipv6)]:
-            existing = [row for row in rows if row['type'] == kind]
-            if address:
-                body = {'type': kind, 'name': domain, 'content': address, 'ttl': 120, 'proxied': False}
-                if existing:
-                    self.request(f"zones/{zone}/dns_records/{existing[0]['id']}", 'PUT', body)
-                    existing = existing[1:]
-                else:
-                    self.request(f'zones/{zone}/dns_records', 'POST', body)
-            for row in existing:
-                self.request(f"zones/{zone}/dns_records/{row['id']}", 'DELETE')
-
-
-def public_ip(version):
-    host = 'api.ipify.org' if version == 4 else 'api6.ipify.org'
-    with urllib.request.urlopen('https://' + host, timeout=10) as response:
+def public_ipv4():
+    with urllib.request.urlopen('https://api.ipify.org', timeout=10) as response:
         address = ipaddress.ip_address(response.read(128).decode().strip())
-    if address.version != version or not address.is_global:
+    if address.version != 4 or not address.is_global:
         raise ValueError('Could not detect a public IP address')
     # Refuse proxy/NAT addresses not actually assigned to this VPS.
     interfaces = json.loads(subprocess.check_output(['ip', '-j', 'address', 'show']))
@@ -247,25 +220,23 @@ def prepare():
     if any(path.stem != domain for path in Path('/etc/letsencrypt/renewal').glob('*.conf')):
         raise ValueError('Other certbot certificates exist. This installer requires a dedicated VPN VPS and will not take over their renewal')
     api = Cloudflare(token)
-    zone = api.zone(domain)
-    ipv4 = public_ip(4)
-    try:
-        ipv6 = public_ip(6)
-    except (OSError, ValueError):
-        ipv6 = None
-    api.point_dns(zone, domain, ipv4, ipv6)
+    api.zone(domain)  # Permission check only; never read/write address records.
+    ipv4 = public_ipv4()
     write_private('/etc/letsencrypt/cloudflare.ini', 'dns_cloudflare_api_token = ' + token + '\n')
     data = load_state(STATE, domain)
+    data['server_address'] = ipv4
+    write_private(STATE / 'state.json', json.dumps(data))
     render(data)
     write_private(STATE / 'domain', domain + '\n')
-    print('DNS configured as DNS only; accounts and profiles generated.' +
-          ('Public IPv6 detected.' if ipv6 else 'No public IPv6 available; tunneled IPv6 cannot reach the internet and will not fall back to the local network.'))
+    print('Accounts and profiles generated using the server public IP. No A/AAAA/CNAME records were modified.')
 
 
 if __name__ == '__main__':
     try:
         if sys.argv[1:] == ['--export']:
             saved = json.loads((STATE / 'state.json').read_text())
+            if 'server_address' not in saved:
+                raise ValueError('Legacy state has no server IP. Rerun the latest install.sh; existing accounts will be preserved')
             render(load_state(STATE, domain_name(saved['domain'])))
         elif len(sys.argv) == 1:
             prepare()

@@ -6,6 +6,7 @@ import re
 import string
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('vpn', Path(__file__).resolve().parents[1] / 'scripts/vpn.py')
 vpn = importlib.util.module_from_spec(spec)
@@ -30,6 +31,8 @@ class DeploymentTests(unittest.TestCase):
             root = Path(tmp)
             state = root / 'var/lib/ikev2-vpn'
             initial = vpn.load_state(state, 'vpn.example.com')
+            initial['server_address'] = '203.0.113.10'
+            vpn.write_private(state / 'state.json', json.dumps(initial))
             vpn.render(initial, root)
             profiles = {p.name: p.read_bytes() for p in (state / 'profiles').glob('*')}
             again = vpn.load_state(state, 'vpn.example.com')
@@ -46,6 +49,7 @@ class DeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             data = vpn.load_state(root / 'var/lib/ikev2-vpn', 'vpn.example.com')
+            data['server_address'] = '203.0.113.10'
             vpn.render(data, root)
             server = (root / 'etc/swanctl/conf.d/ikev2-vpn.conf').read_text()
             summary = (root / 'tmp/usr.txt').read_text()
@@ -62,6 +66,8 @@ class DeploymentTests(unittest.TestCase):
                 self.assertEqual(ike['IncludeAllNetworks'], 1)
                 self.assertEqual(ike['ExcludeLocalNetworks'], 0)
                 self.assertEqual(ike['RemoteIdentifier'], data['domain'])
+                self.assertEqual(ike['RemoteAddress'], data['server_address'])
+                self.assertNotEqual(ike['RemoteAddress'], ike['RemoteIdentifier'])
                 self.assertNotIn('PayloadCertificateUUID', ike)
                 self.assertIn(u['username'], server)
                 self.assertIn(u['password'], server)
@@ -87,22 +93,29 @@ class DeploymentTests(unittest.TestCase):
                 vpn.domain_name(name)
         self.assertEqual(vpn.domain_name('VPN.Example.com.'), 'vpn.example.com')
 
-    def test_dns_records_converge_and_remove_stale_ipv6(self):
-        class FakeCF(vpn.Cloudflare):
-            def __init__(self):
-                self.calls = []
-            def records(self, zone, domain):
-                return [{'type': t, 'id': str(i)} for i, t in enumerate(['A', 'A', 'AAAA', 'TXT'])]
-            def request(self, path, method='GET', data=None):
-                self.calls.append((path, method, data))
-        api = FakeCF()
-        api.point_dns('zone', 'vpn.example.com', '203.0.113.10', None)
-        self.assertEqual([c[1] for c in api.calls], ['PUT', 'DELETE', 'DELETE'])
-        self.assertFalse(api.calls[0][2]['proxied'])
-        self.assertFalse(any(c[0].endswith('/3') for c in api.calls))  # TXT preserved.
-        api.records = lambda *_: [{'type': 'CNAME'}]
-        with self.assertRaises(ValueError):
-            api.point_dns('zone', 'vpn.example.com', '203.0.113.10', None)
+    def test_prepare_checks_zone_without_modifying_dns_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            writes = []
+            def capture(path, data, *args):
+                writes.append(str(path))
+                if Path(path).is_relative_to(state):
+                    vpn_write(path, data, *args)
+            vpn_write = vpn.write_private
+            with (mock.patch.object(vpn, 'STATE', state),
+                  mock.patch.object(vpn.sys, 'stdin', __import__('io').StringIO('vpn.example.com\n' + 'a' * 40 + '\n')),
+                  mock.patch.object(vpn.Cloudflare, 'request', return_value=[{'id': 'zone'}]) as request,
+                  mock.patch.object(vpn, 'public_ipv4', return_value='203.0.113.10'),
+                  mock.patch.object(vpn, 'write_private', side_effect=capture),
+                  mock.patch.object(vpn, 'render') as render):
+                vpn.prepare()
+                self.assertTrue(request.called)
+                for call in request.call_args_list:
+                    self.assertTrue(call.args[0].startswith('zones?'))
+                    self.assertEqual(len(call.args), 1)  # Default GET; no record mutation.
+                    self.assertFalse(call.kwargs)
+                self.assertEqual(render.call_args.args[0]['server_address'], '203.0.113.10')
+                self.assertEqual(len(render.call_args.args[0]['users']), 2)
 
 
 if __name__ == '__main__':

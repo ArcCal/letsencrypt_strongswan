@@ -3,15 +3,27 @@
 set -euo pipefail
 cd /repo
 export PYTHONDONTWRITEBYTECODE=1
-shellcheck install.sh scripts/renew.sh config/certbot-deploy-hook.sh tests/integration.sh
+shellcheck install.sh scripts/install-body.sh scripts/renew.sh config/certbot-deploy-hook.sh tests/integration.sh
 python3 -m unittest discover -s tests -v
+# Exercise the downloaded file alone, with no companion sources or network.
+mkdir -p /tmp/standalone
+cp install.sh /tmp/standalone/install.sh
+if bash /tmp/standalone/install.sh > /tmp/standalone.log 2>&1; then
+    echo 'Container should be rejected as a production VPS' >&2
+    exit 1
+fi
+grep 'A VPS booted with systemd is required' /tmp/standalone.log
+if find /tmp -maxdepth 1 -type d -name 'ikev2-vpn.*' | grep -q .; then
+    echo 'Embedded installer left temporary sources behind' >&2
+    exit 1
+fi
 mkdir -p /var/lib/ikev2-vpn /etc/swanctl/{x509,x509ca,private} /etc/letsencrypt/live/vpn.example.com /test-bin
 # Validate the actual installer's unit heredocs and merged vendor/drop-in syntax.
 python3 - <<'PY'
 from pathlib import Path
 import re
 import subprocess
-text = Path('install.sh').read_text()
+text = Path('scripts/install-body.sh').read_text()
 for path, contents in re.findall(r"cat > (/etc/systemd/system/[^ ]+) <<'UNIT'\n(.*?)\nUNIT", text, re.S):
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -31,7 +43,9 @@ import sys
 from pathlib import Path
 sys.path.insert(0, '/repo/scripts')
 import vpn
-vpn.render(vpn.load_state(Path('/var/lib/ikev2-vpn'), 'vpn.example.com'))
+state = vpn.load_state(Path('/var/lib/ikev2-vpn'), 'vpn.example.com')
+state['server_address'] = '203.0.113.10'
+vpn.render(state)
 vpn.write_private('/var/lib/ikev2-vpn/domain', 'vpn.example.com\n')
 PY
 LINEAGE=/etc/letsencrypt/live/vpn.example.com
