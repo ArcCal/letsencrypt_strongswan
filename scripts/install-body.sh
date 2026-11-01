@@ -155,7 +155,12 @@ nft -c -f /etc/ikev2-vpn/firewall.nft
 systemctl daemon-reload
 systemctl enable ikev2-vpn-firewall.service strongswan.service ikev2-vpn-renew.timer
 systemctl restart ikev2-vpn-firewall.service
-systemctl restart strongswan.service
+systemctl reset-failed strongswan.service
+if ! systemctl restart strongswan.service; then
+    systemctl --no-pager --full status strongswan.service >&2 || true
+    journalctl -u strongswan.service -b -n 100 --no-pager >&2 || true
+    die 'strongSwan startup failed. Diagnostics are shown above; existing accounts and certificates were preserved.'
+fi
 swanctl --load-all --noprompt
 swanctl --list-conns
 swanctl --list-pools

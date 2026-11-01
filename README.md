@@ -1,7 +1,6 @@
 # Let's Encrypt + strongSwan: IKEv2 VPN with two inputs
 
-Run `install.sh` on a dedicated VPS, entering only **VPN domain** and **Cloudflare API token**.
-The script installs strongSwan, obtains a public CA certificate through certbot and Cloudflare DNS-01, generates two random accounts and two iPhone `.mobileconfig` files, and configures full tunneling, firewall and automatic renewal.
+Run `install.sh` on a dedicated VPS and enter only the **certificate domain** and **Cloudflare API token**. The installer sets up strongSwan, obtains a public CA certificate using certbot and Cloudflare DNS-01, generates two random accounts and two iPhone `.mobileconfig` profiles, and configures full-tunnel routing, a firewall, and automatic renewal.
 
 The server authenticates with a Let's Encrypt certificate. Clients authenticate with **EAP-MSCHAPv2 usernames and passwords**. Clients do not need client certificates or a private CA installation. Server certificate and domain validation remain enabled.
 
@@ -28,8 +27,8 @@ Create an API token scoped to the target domain zone:
 
 | Scope | Permission |
 | --- | --- |
-| Zone | Zone -> Read |
-| Zone | DNS -> Edit |
+| Zone | Zone: Read |
+| Zone | DNS: Edit |
 | Zone Resources | Include: Specific zone: the target zone |
 
 Zone Read locates the domain zone. DNS Edit is used only to create and clean up `_acme-challenge` TXT records during issuance and renewal. A Global API Key is not required. The token must remain valid for future renewals. If it restricts source IPs, include the server egress address.
@@ -64,8 +63,7 @@ VPN certificate domain (FQDN): vpn.example.com
 Cloudflare API token (hidden input):
 ```
 
-Use a full domain without scheme, port, path or wildcard; international domains require punycode.
-The token is hidden, never passed in arguments or written to account files. Avoid `bash -x` and shared terminal recordings. Invalid inputs or permissions cause an error and exit without further prompts.
+Use an FQDN without a scheme, port, path, or wildcard. International domains must use punycode. The token is hidden, never placed in command arguments, and never written into the account summary. Do not run with `bash -x` or record terminal input to shared logs. Invalid input or insufficient permissions cause an error and exit instead of another prompt.
 
 The installer automatically:
 
@@ -216,7 +214,9 @@ python3 scripts/build-installer.py
 
 Generation is offline. Tests verify the embedded checksum, exact source correspondence, and reproducible output. The embedded SHA-256 detects corruption, not authenticity; download through trusted HTTPS.
 
-Python unit tests use only the standard library and do not contact Cloudflare or ACME:
+`build-installer.py` only packages this repository's scripts and configuration. It does not compile strongSwan or install a compiler toolchain. Production installation always obtains strongSwan through `apt-get install` from the configured distribution repositories. If strongSwan startup fails, the installer prints its service status and recent journal entries automatically.
+
+Unit tests use the Python standard library without contacting Cloudflare or ACME:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
@@ -230,7 +230,7 @@ Build and run the supplied development image from the repository root. CA trust 
 docker build -f tests/Dockerfile \
   --secret id=proxy_ca,src=/etc/ssl/certs/ca-certificates.crt \
   -t ikev2-vpn-test:local .
-docker run --rm --cap-drop ALL \
+docker run --rm --network none --cap-drop ALL \
   --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE --cap-add NET_RAW \
   --security-opt no-new-privileges \
   ikev2-vpn-test:local bash /repo/tests/integration.sh
@@ -242,4 +242,6 @@ The daemon test also enforces the configured socket address families using libse
 
 ## 10. Project history
 
-This version adds two-input deployment, two random EAP accounts, Apple profiles, repeatability and certificate lifecycle management. It retains IKEv2, public CA server certificates, password authentication and full-tunnel VPN. Legacy account/client examples in `config/` are manual references; automation uses `scripts/vpn.py` and does not load example passwords.
+The project began as an IKEv2 VPN tutorial in 2016, using source-built strongSwan, `ipsec.conf`, [acme.sh](https://github.com/acmesh-official/acme.sh) standalone issuance, and iptables. In 2026 it moved to distribution packages, swanctl, certbot Cloudflare DNS-01, and nftables.
+
+This version adds two-input automated deployment, two random EAP accounts, Apple profiles, repeatable installation, and certificate lifecycle management while retaining IKEv2, public CA server certificates, password-based client authentication, and a full-tunnel VPN. Legacy account/client files in `config/` are manual references only. Automated deployment uses `scripts/vpn.py` and never loads example passwords.

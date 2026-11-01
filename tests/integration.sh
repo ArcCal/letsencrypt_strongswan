@@ -74,7 +74,7 @@ cp /tmp/key2.pem "$LINEAGE/privkey.pem"
 if sh config/certbot-deploy-hook.sh; then echo 'Mismatched key was accepted' >&2; exit 1; fi
 cmp /tmp/cert1.pem /etc/swanctl/x509/vpn-server.pem
 cp /tmp/key1.pem "$LINEAGE/privkey.pem"
-/usr/sbin/charon-systemd >/tmp/charon.log 2>&1 &
+python3 tests/restrict_address_families.py config/strongswan-hardening.conf /usr/sbin/charon-systemd >/tmp/charon.log 2>&1 &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
 for ((n=0; n<5; n++)); do test ! -S /var/run/charon.vici || break; sleep 1; done

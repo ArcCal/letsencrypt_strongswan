@@ -69,6 +69,7 @@ class DeploymentTests(unittest.TestCase):
             summary = (root / 'tmp/usr.txt').read_text()
             for u in data['users']:
                 profile = plistlib.loads((root / f"var/lib/ikev2-vpn/profiles/{u['username']}.mobileconfig").read_bytes())
+                self.assertTrue((root / f"var/lib/ikev2-vpn/profiles/{u['username']}.mobileconfig").read_text().isascii())
                 self.assertEqual(len(profile['PayloadContent']), 1)  # No client or CA certificate payload.
                 payload = profile['PayloadContent'][0]
                 self.assertEqual(payload['VPNType'], 'IKEv2')
@@ -87,6 +88,7 @@ class DeploymentTests(unittest.TestCase):
                 self.assertIn(u['password'], server)
                 self.assertIn(u['username'], summary)
                 self.assertIn(u['password'], summary)
+            self.assertTrue(summary.isascii())
             self.assertIn('local_ts = 0.0.0.0/0, ::/0', server)
 
     def test_export_replaces_symlink_without_touching_target(self):

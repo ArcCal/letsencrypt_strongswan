@@ -201,7 +201,7 @@ def public_ipv4():
     with urllib.request.urlopen('https://api.ipify.org', timeout=10) as response:
         address = ipaddress.ip_address(response.read(128).decode().strip())
     if address.version != 4 or not address.is_global:
-        raise ValueError('Could not detect a public IP address')
+        raise ValueError('Could not detect a public IPv4 address')
     # GCE and other clouds map external IPs to private NIC addresses. The public
     # client endpoint must not be required to appear on a local interface.
     # Observing the egress address does not prove inbound UDP reachability.
