@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Root-only deployment state, Cloudflare DNS and Apple profile generation."""
 import ipaddress
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import plistlib
 import re
 import secrets
 import string
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -30,6 +32,8 @@ def write_private(path, data, mode=0o600):
         os.fchmod(fd, mode)
         with os.fdopen(fd, 'wb') as stream:
             stream.write(data.encode() if isinstance(data, str) else data)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -37,6 +41,8 @@ def write_private(path, data, mode=0o600):
 
 
 def domain_name(value):
+    if not isinstance(value, str):
+        raise ValueError('A domain name must be a string')
     value = value.strip().lower().rstrip('.')
     if (len(value) > 253 or '.' not in value or
             not all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', part)
@@ -67,10 +73,18 @@ def load_state(root, domain):
     path = root / 'state.json'
     if path.exists():
         data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ValueError('Saved deployment state must be an object')
+        if not isinstance(data.get('domain'), str):
+            raise ValueError('Saved deployment domain is invalid')
         if data['domain'] != domain:
             raise ValueError('An existing deployment uses another domain. Migrate it before changing the domain')
-        users = data['users']
-        if (len(users) != 2 or len({u['username'] for u in users}) != 2 or
+        users = data.get('users')
+        if (not isinstance(users, list) or len(users) != 2 or
+                any(not isinstance(u, dict) or
+                    not isinstance(u.get('username'), str) or
+                    not isinstance(u.get('password'), str) for u in users) or
+                len({u['username'] for u in users}) != 2 or
                 any(not re.fullmatch(r'[A-Za-z0-9]{8}', u['username']) or
                     not re.fullmatch('[' + re.escape(string.ascii_letters + string.digits + SYMBOLS) + ']{22}', u['password'])
                     for u in users)):
@@ -118,9 +132,9 @@ def profile(domain, user, address):
     })
 
 
-def render(data, root=Path('/')):
+def render(data, root=Path('/'), *, write_server=True):
     domain = data['domain']
-    address = str(ipaddress.ip_address(data['server_address']))
+    address = str(ipaddress.IPv4Address(data['server_address']))
     (root / 'var/lib/ikev2-vpn/profiles').mkdir(parents=True, exist_ok=True, mode=0o700)
     text = f'''# Managed by ikev2-vpn. Do not put other VPN connections in this file.
 connections {{
@@ -168,8 +182,54 @@ secrets {{
         write_private(root / f'var/lib/ikev2-vpn/profiles/{name}.mobileconfig', profile(domain, user, address))
         output.extend(['', 'VPN name: ' + label, 'Username: ' + name, 'Password: ' + password,
                        'Profile: /var/lib/ikev2-vpn/profiles/' + name + '.mobileconfig'])
-    write_private(root / 'etc/swanctl/conf.d/ikev2-vpn.conf', text + '}\n')
+    if write_server:
+        write_private(root / 'etc/swanctl/conf.d/ikev2-vpn.conf', text + '}\n')
     write_private(root / 'tmp/usr.txt', '\n'.join(output) + '\n')
+
+
+def export_profiles():
+    # Serialize with installation, then export without changing live VPN settings.
+    fd = os.open(STATE / 'install.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        saved = json.loads((STATE / 'state.json').read_text())
+        if not isinstance(saved, dict):
+            raise ValueError('Saved deployment state must be an object')
+        if 'server_address' not in saved:
+            raise ValueError('Legacy state has no server IP. Rerun the latest install.sh; existing accounts will be preserved')
+        render(load_state(STATE, domain_name(saved.get('domain'))), write_server=False)
+
+
+def parse_ssh_ports(config, listeners, socket_units, connection):
+    ports = set()
+    def add(value):
+        if value.isdigit() and 1 <= int(value) <= 65535:
+            ports.add(int(value))
+    for port in re.findall(r'^port\s+(\d+)\s*$', config, re.M):
+        add(port)
+    for line in listeners.splitlines():
+        fields = line.split()
+        if '"sshd"' in line and len(fields) >= 4:
+            add(fields[3].rsplit(':', 1)[-1])
+    for port in re.findall(r'(?:^|[:\s])(\d+)\s+\(Stream\)', socket_units, re.M):
+        add(port)
+    fields = connection.split()
+    if len(fields) == 4:
+        add(fields[-1])
+    return sorted(ports or {22})
+
+
+def ssh_ports():
+    def output(args):
+        try:
+            return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, errors='replace', timeout=10, check=False).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return ''
+    ports = parse_ssh_ports(output(['/usr/sbin/sshd', '-T']), output(['ss', '-H', '-ltnp']),
+                            output(['systemctl', 'show', 'ssh.socket', 'sshd.socket',
+                                    '--property=Listen', '--value']), os.environ.get('SSH_CONNECTION', ''))
+    print(','.join(map(str, ports)))
 
 
 class Cloudflare:
@@ -234,10 +294,9 @@ def prepare():
 if __name__ == '__main__':
     try:
         if sys.argv[1:] == ['--export']:
-            saved = json.loads((STATE / 'state.json').read_text())
-            if 'server_address' not in saved:
-                raise ValueError('Legacy state has no server IP. Rerun the latest install.sh; existing accounts will be preserved')
-            render(load_state(STATE, domain_name(saved['domain'])))
+            export_profiles()
+        elif sys.argv[1:] == ['--ssh-ports']:
+            ssh_ports()
         elif len(sys.argv) == 1:
             prepare()
         else:

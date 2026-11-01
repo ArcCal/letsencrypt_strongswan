@@ -52,7 +52,7 @@ if apt-cache show libstrongswan-standard-plugins >/dev/null 2>&1; then
 fi
 apt-get install -y -o Dpkg::Options::=--force-confold --no-install-recommends \
     "${SWAN_PACKAGES[@]}" nftables \
-    certbot python3-certbot-dns-cloudflare python3 openssl iproute2 ca-certificates
+    certbot python3-certbot-dns-cloudflare python3 openssl iproute2 procps ca-certificates
 
 # Refuse unmanaged rules/configuration instead of flushing someone else's firewall.
 python3 - <<'PY'
@@ -76,6 +76,9 @@ if any(line.strip() and not line.lstrip().startswith('#') and
     sys.exit('swanctl.conf contains custom settings and cannot be managed automatically.')
 PY
 
+# Claim only the reserved configuration after checking for unmanaged files.
+# Keep this marker even if a later step fails so a partial setup can be retried.
+touch /var/lib/ikev2-vpn/managed
 install -d -m 700 /usr/local/lib/ikev2-vpn
 install -m 700 "$REPO/scripts/vpn.py" /usr/local/lib/ikev2-vpn/vpn.py
 install -m 700 "$REPO/scripts/renew.sh" /usr/local/lib/ikev2-vpn/renew.sh
@@ -85,9 +88,9 @@ flock 8
 printf '%s\n%s\n' "$DOMAIN" "$CF_TOKEN" | python3 /usr/local/lib/ikev2-vpn/vpn.py
 unset CF_TOKEN
 DOMAIN=$(cat /var/lib/ikev2-vpn/domain)
-touch /var/lib/ikev2-vpn/managed
 install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy /etc/swanctl/x509 /etc/swanctl/x509ca
 install -d -m 700 /etc/swanctl/private
+: >> /var/lib/ikev2-vpn/deploy.lock
 install -m 700 "$REPO/config/certbot-deploy-hook.sh" /etc/letsencrypt/renewal-hooks/deploy/ikev2-vpn
 
 # Noninteractive registration deliberately has no email: documented in README.
@@ -104,19 +107,13 @@ openssl x509 -in "/etc/letsencrypt/live/$DOMAIN/cert.pem" -noout -checkend 0
 # Also deploy when certbot reuses an existing unexpired certificate.
 RENEWED_LINEAGE="/etc/letsencrypt/live/$DOMAIN" /etc/letsencrypt/renewal-hooks/deploy/ikev2-vpn
 unset IKEV2_VPN_SKIP_RELOAD
-flock -u 8
 
 install -m 644 "$REPO/config/99-vpn-sysctl.conf" /etc/sysctl.d/99-ikev2-vpn.conf
 sysctl -p /etc/sysctl.d/99-ikev2-vpn.conf
 install -d -m 755 /etc/ikev2-vpn
 install -m 644 "$REPO/config/nftables-vpn.conf" /etc/ikev2-vpn/firewall.nft
 # Detect configured SSH ports, including nonstandard ports, without another prompt.
-SSH_PORTS=$( { /usr/sbin/sshd -T 2>/dev/null || true; } | awk '$1 == "port" && $2 ~ /^[0-9]+$/ {print $2}')
-SSH_PORTS+=$'\n'$(ss -H -ltnp | awk '/"sshd"/ {addr=$4; sub(/.*:/,"",addr); if(addr ~ /^[0-9]+$/) print addr}')
-SSH_PORTS=$(printf '%s\n' "$SSH_PORTS" | awk 'NF')
-SSH_PORTS="${SSH_PORTS:-22}"
-if [[ ${SSH_CONNECTION:-} ]]; then SSH_PORTS+=$'\n'"${SSH_CONNECTION##* }"; fi
-SSH_PORTS=$(printf '%s\n' "$SSH_PORTS" | sort -nu | paste -sd, -)
+SSH_PORTS=$(python3 /usr/local/lib/ikev2-vpn/vpn.py --ssh-ports)
 sed -i "s/SSH_PORTS/$SSH_PORTS/" /etc/ikev2-vpn/firewall.nft
 cat > /etc/systemd/system/ikev2-vpn-firewall.service <<'UNIT'
 [Unit]
@@ -177,4 +174,5 @@ systemctl start ikev2-vpn-renew.timer
 # Dedicated host: use the hardened renewal service, never a second unsandboxed timer.
 systemctl disable --now certbot.timer
 systemctl is-active --quiet strongswan.service ikev2-vpn-firewall.service ikev2-vpn-renew.timer
+flock -u 8
 printf '\nDeployment complete. Both accounts: /tmp/usr.txt\nProfiles: /var/lib/ikev2-vpn/profiles/*.mobileconfig\nTransfer profiles securely to the iPhone and install them. Allow inbound UDP 500/4500 in the cloud firewall.\n'

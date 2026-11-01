@@ -6,20 +6,26 @@ DOMAIN=$(cat /var/lib/ikev2-vpn/domain)
 LINEAGE=${RENEWED_LINEAGE:?must be run by certbot or the installer}
 # certbot may also renew unrelated certificates on this host.
 [ "$LINEAGE" = "/etc/letsencrypt/live/$DOMAIN" ] || exit 0
+# Separate from cert.lock: callers hold that lock while certbot runs this hook.
+exec 9>/var/lib/ikev2-vpn/deploy.lock
+flock 9
 SWANCTL=/etc/swanctl
-openssl x509 -in "$LINEAGE/cert.pem" -noout -checkend 0 >/dev/null
-openssl x509 -in "$LINEAGE/cert.pem" -noout -checkhost "$DOMAIN" >/dev/null
 STAGE=$(mktemp -d "$SWANCTL/.vpn-cert.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT HUP INT TERM
-openssl x509 -in "$LINEAGE/cert.pem" -pubkey -noout > "$STAGE/cert.pub"
-openssl pkey -in "$LINEAGE/privkey.pem" -pubout > "$STAGE/key.pub"
-cmp -s "$STAGE/cert.pub" "$STAGE/key.pub"
+# Validate the exact snapshot that will be installed, not mutable source paths.
 install -m 0644 "$LINEAGE/cert.pem" "$STAGE/vpn-server.pem"
 install -m 0600 "$LINEAGE/privkey.pem" "$STAGE/vpn-server.key"
+install -m 0644 "$LINEAGE/chain.pem" "$STAGE/chain.pem"
+openssl x509 -in "$STAGE/vpn-server.pem" -noout -checkend 0 >/dev/null
+openssl verify -CApath /etc/ssl/certs -untrusted "$STAGE/chain.pem" \
+    -purpose sslserver -verify_hostname "$DOMAIN" "$STAGE/vpn-server.pem" >/dev/null
+openssl x509 -in "$STAGE/vpn-server.pem" -pubkey -noout > "$STAGE/cert.pub"
+openssl pkey -in "$STAGE/vpn-server.key" -pubout > "$STAGE/key.pub"
+cmp -s "$STAGE/cert.pub" "$STAGE/key.pub"
 awk -v dir="$STAGE" '
     /-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/letsencrypt-chain-%d.pem", dir, n) }
     n > 0 { print > f }
-' "$LINEAGE/chain.pem"
+' "$STAGE/chain.pem"
 for cert in "$STAGE"/letsencrypt-chain-*.pem; do
     openssl x509 -in "$cert" -noout >/dev/null
     chmod 0644 "$cert"

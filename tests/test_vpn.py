@@ -16,6 +16,48 @@ spec.loader.exec_module(vpn)
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_export_does_not_rewrite_server_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / 'var/lib/ikev2-vpn'
+            data = vpn.load_state(state, 'vpn.example.com')
+            data['server_address'] = '203.0.113.10'
+            vpn.write_private(state / 'state.json', json.dumps(data))
+            server = root / 'etc/swanctl/conf.d/ikev2-vpn.conf'
+            vpn.write_private(server, '# existing operator settings\n')
+            render = vpn.render
+            with mock.patch.object(vpn, 'STATE', state), mock.patch.object(
+                    vpn, 'render', side_effect=lambda data, **kwargs: render(data, root, **kwargs)):
+                vpn.export_profiles()
+            self.assertEqual(server.read_text(), '# existing operator settings\n')
+            self.assertEqual(json.loads((state / 'state.json').read_text()), data)
+            self.assertEqual(len(list((state / 'profiles').glob('*.mobileconfig'))), 2)
+            self.assertTrue((root / 'tmp/usr.txt').exists())
+
+    def test_invalid_saved_state_is_rejected_without_overwrite(self):
+        samples = [[], {}, {'domain': None}, {'domain': 'vpn.example.com', 'users': None},
+                   {'domain': 'vpn.example.com', 'users': ['first', 'second']},
+                   {'domain': 'vpn.example.com', 'users': [{'username': 123}, {}]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for data in samples:
+                with self.subTest(data=data):
+                    encoded = json.dumps(data)
+                    vpn.write_private(root / 'state.json', encoded)
+                    with self.assertRaises(ValueError):
+                        vpn.load_state(root, 'vpn.example.com')
+                    self.assertEqual((root / 'state.json').read_text(), encoded)
+
+    def test_ssh_ports_cover_socket_activation_and_current_session(self):
+        ports = vpn.parse_ssh_ports('port 22\nport 2200\n',
+            'LISTEN 0 128 [::]:2222 [::]:* users:(("sshd",pid=7,fd=3))\n'
+            'LISTEN 0 128 0.0.0.0:8080 *:* users:(("python3",pid=8,fd=4))',
+            '[::]:2022 (Stream)\n0.0.0.0:3022 (Stream)\n/run/ssh22 (Stream)',
+            '192.0.2.2 54321 192.0.2.1 4022')
+        self.assertEqual(ports, [22, 2022, 2200, 2222, 3022, 4022])
+        self.assertEqual(vpn.parse_ssh_ports('', '', '2222 (Stream)', ''), [2222])
+        self.assertEqual(vpn.parse_ssh_ports('port 0\nport 65536\n', '', '', 'invalid input'), [22])
+
     def test_ipv4_pool_avoids_lan_and_matches_firewall(self):
         lan = ipaddress.ip_network('10.10.0.0/16')
         self.assertFalse(vpn.IPV4_POOL.overlaps(lan))

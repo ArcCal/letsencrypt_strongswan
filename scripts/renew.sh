@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+# Installation may defer loading, but scheduled renewal must always reload.
+unset IKEV2_VPN_SKIP_RELOAD
 exec 9>/var/lib/ikev2-vpn/cert.lock
 flock 9
 DOMAIN=$(cat /var/lib/ikev2-vpn/domain)

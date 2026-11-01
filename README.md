@@ -71,7 +71,7 @@ The installer automatically:
 2. Checks Cloudflare zone access and detects the public IPv4 client endpoint without changing address records.
 3. Generates and persists two cryptographically random accounts and renders server configuration and Apple profiles.
 4. Obtains an ECDSA P-256 certificate through certbot DNS-01, with a 60-second DNS propagation delay. Ports 80/443 are not required.
-5. Deploys the leaf certificate, private key, and individually split intermediate certificates after checking expiration, hostname, and key matching.
+5. Deploys the leaf certificate, private key, and individually split intermediate certificates after checking validity dates, trusted chain, server purpose, hostname, and key matching.
 6. Configures IPv4 forwarding, dedicated nftables tables, boot services, and the certificate timer; removes legacy VPN IPv6 forwarding/NAT.
 7. Starts strongSwan, loads accounts, certificates, connections, and pools, and checks service status.
 
@@ -105,6 +105,8 @@ Credential files are root-owned with mode `0600`. Do not publish them in Git, on
 ```sh
 python3 /usr/local/lib/ikev2-vpn/vpn.py --export
 ```
+
+Export waits for any installation to finish and writes only profiles and the summary; it does not rewrite the live server configuration.
 
 Rerunning the installer for the same domain still asks only for the domain and token. It preserves accounts, profile identifiers, and passwords, and can update the token. If the VPS public IP changes, rerun installation to detect the new IP and redistribute the profiles. Profiles do not follow domain DNS changes. Changing the domain is rejected to protect an existing deployment; plan a migration separately. Do not delete saved state as a repair step.
 
@@ -147,7 +149,8 @@ The installer uses the production Let's Encrypt ACME service with certbot and Cl
 - `ikev2-vpn-renew.timer` runs twice daily, with up to one hour of randomized delay and persistent catch-up after missed runs.
 - Each run checks expiration with OpenSSL. Missing or expired certificates trigger immediate issuance. Valid certificates go through `certbot renew`, allowing certbot to decide when renewal is due instead of hardcoding certificate lifetimes.
 - Successful issuance invokes the deploy hook. The scheduled check also redeploys the current valid certificate to recover from a previous deployment failure.
-- Before deployment, the hook checks expiration, domain, key matching, and intermediate certificate syntax. Files go into `/etc/swanctl/x509/`, `private/`, and `x509ca/`.
+- Before deployment, the hook validates a private snapshot: validity dates, chain against the system CA store, server purpose, domain, key matching, and intermediate certificate syntax. Invalid credentials leave the installed pair untouched. Files go into `/etc/swanctl/x509/`, `private/`, and `x509ca/`.
+- Installation and scheduled renewal share a certificate lock, held through installation readiness checks. A separate deployment lock serializes certificate hooks without recursively acquiring the caller's lock.
 - A running daemon reloads credentials with `swanctl --load-creds --noprompt`, without restarting VPN sessions. Reload failures are returned as failures.
 - During installation only, the hook deploys files without contacting VICI. The installer then repairs service settings, restarts strongSwan, and requires `swanctl --load-all` to succeed. This allows recovery from a crashed daemon with a stale socket. Scheduled renewal still requires a successful live credential reload and reports daemon/reload failures.
 - Unrelated certificate lineages are ignored by the hook. The dedicated host must not already manage certbot certificates for other domains. After installation, the default `certbot.timer` is disabled in favour of the hardened renewal service, avoiding an additional unsandboxed timer entry point.
@@ -205,13 +208,13 @@ Credentials are not passed in command arguments. Tokens, account state, summarie
 | Restriction | strongSwan | Certificate checks and renewal |
 | --- | --- | --- |
 | Privilege escalation | NoNewPrivileges; only NET_ADMIN, NET_BIND_SERVICE, NET_RAW capabilities | NoNewPrivileges; empty capability set |
-| Writes | Read-only system, writable `/run` | Certificate/credential directories, certbot work/log directories, and the certificate lock file only |
+| Writes | Read-only system, writable `/run` | Certificate/credential directories, certbot work/log directories, and the certificate/deployment lock files only |
 | Sensitive files | Cloudflare/ACME data, persistent account backups, and profiles hidden | Additional account backups and profiles hidden |
 | System control | systemd private control socket and system D-Bus hidden | Same; the hook reloads directly through VICI |
 | Devices and kernel | Private devices, protected tunables/modules/control groups/kernel logs | Same |
 | Other | Private temporary directory; protected home directories; restricted address families, namespaces, setuid, and realtime scheduling; no writable executable memory | Similar restrictions, with memory behaviour needed by certbot/Python allowed |
 
-Before allowing client forwarding, the firewall checks the IPsec decryption marker rather than trusting only source IPs. VPN clients cannot access host services such as SSH, other VPN users, common private/link-local networks, or cloud metadata endpoints. This version is not intended for corporate private-network access.
+Before allowing client forwarding, including established connections, the firewall checks the IPsec decryption marker rather than trusting only source IPs. VPN clients cannot access host services such as SSH, other VPN users, common private/link-local networks, or cloud metadata endpoints. SSH port detection includes systemd socket activation and the current SSH session. This version is not intended for corporate private-network access.
 
 These measures limit some consequences of a service compromise; they do not contain a host-root or kernel compromise. strongSwan needs `CAP_NET_ADMIN` to install IPsec policies, which carries network-management risk. Renewal needs access to the token and private key. Host-root or kernel control can bypass restrictions and expose credentials. Scope the Cloudflare token to the required zone to limit DNS impact if it leaks.
 
@@ -257,7 +260,35 @@ docker run --rm --network none --cap-drop ALL \
 
 Use `--build-arg BASE_IMAGE=debian:12-slim` or `--build-arg BASE_IMAGE=ubuntu:22.04` to exercise the minimum supported releases. The default test image uses Debian 13. The daemon executable is discovered from the `charon-systemd` package rather than assuming the same installation path across releases.
 
-Tests include static validation of systemd units/drop-ins and real daemon startup with reduced capabilities. The container does not run full systemd, so its sandbox and boot behaviour are not fully verified. Validation does not cover a real VPS installation/reboot, live Cloudflare writes and Let's Encrypt issuance, physical iPhone 18 Pro Max installation/connection, or end-to-end internet ESP/NAT traffic. Profiles follow the [official Apple device-management schema](https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.vpn.managed.yaml); parsing a plist does not establish physical-device compatibility.
+For actual systemd sandbox and terminal-installation tests, build a second disposable image. The fixture CA and mocked external services belong only to this test image. Never run these helpers on a VPS. Privileged mode permits the isolated systemd manager and network namespaces; do not add host filesystem mounts or host networking.
+
+```sh
+docker build --no-cache -f tests/systemd.Dockerfile \
+  --build-arg TEST_IMAGE=ikev2-vpn-test:local -t ikev2-vpn-systemd:local .
+docker run -d --name ikev2-vpn-audit --privileged --cgroupns=private \
+  --network none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
+  -e container=docker ikev2-vpn-systemd:local
+docker exec ikev2-vpn-audit bash /repo/tests/systemd.sh
+docker exec ikev2-vpn-audit python3 /repo/tests/installer.py
+docker exec ikev2-vpn-audit python3 /repo/tests/firewall.py
+docker exec ikev2-vpn-audit python3 /repo/tests/peer.py
+docker rm -f ikev2-vpn-audit
+```
+
+Use a fresh container and rebuild the second image without cache for each run: its certificate fixtures are deliberately short-lived. `systemd.sh` checks the real service manager, effective hardening, restart, and sandboxed certificate reload. `installer.py` uses a real terminal and the standalone artifact: exactly two prompts, hidden token, issuance failure and recovery, repeated installation, account preservation, file modes, and socket-activated SSH. Package operations, Cloudflare/endpoint discovery, and CA issuance are mocked; installed distribution packages, sysctl, firewall, systemd, and VICI are real. `firewall.py` reproduces the previous conntrack bypass using isolated TCP fixtures, then verifies that input and forwarding remain blocked after removing a temporary seed rule. `peer.py` authenticates both generated users with real IKEv2/EAP-MSCHAPv2 and rejects wrong passwords, wrong server identities, and untrusted certificates. Its client has no private certificate. All peer and metadata fixtures are isolated local namespaces.
+
+Audit results (2026-11-01):
+
+| Test | Debian 12 / strongSwan 5.9.8 | Debian 13 / strongSwan 6.0.1 | Ubuntu 22.04 / strongSwan 5.9.5 |
+| --- | --- | --- | --- |
+| 17 unit tests, shellcheck, certificate/firewall integration | Passed | Passed | Passed |
+| Actual systemd startup, restart, sandboxed renewal | Passed | Passed | Passed |
+| Complete terminal installer and failure recovery | Passed | Passed | Passed |
+| Established-connection firewall regression | Passed | Passed | Passed |
+| Both EAP accounts and negative authentication checks | Passed | Passed | Passed |
+| ESP data plane | Kernel limitation | Kernel limitation | Kernel limitation |
+
+The shared test kernel rejects ESP SA installation with netlink error 93 (unsupported protocol/type). `peer.py` returns **77** only when this kernel error is confirmed; that result is not a data-plane pass. End-to-end ESP/NAT internet forwarding and renewal during an active CHILD_SA remain unverified. Validation also does not cover a real VPS reboot, live Cloudflare writes and Let's Encrypt issuance, or physical iPhone 18 Pro Max installation/connection and IPv6 leak behaviour. Profiles follow the [official Apple device-management schema](https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.vpn.managed.yaml); parsing a plist does not establish physical-device compatibility.
 
 The daemon test also enforces the configured socket address families using libseccomp. Distribution plugins need `AF_PACKET` for ARP/packet sockets and `AF_ALG` for kernel cryptography; both are allowed. This does not emulate all systemd sandbox settings.
 

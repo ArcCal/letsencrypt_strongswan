@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # DESTRUCTIVE TO CONTAINER FILESYSTEM: run only in a disposable vpn-dev container.
 set -euo pipefail
+[[ -f /.dockerenv ]] || { echo 'Run only in a disposable Docker container' >&2; exit 1; }
 cd /repo
 export PYTHONDONTWRITEBYTECODE=1
 shellcheck install.sh scripts/install-body.sh scripts/renew.sh config/certbot-deploy-hook.sh tests/integration.sh
@@ -53,6 +54,8 @@ export LINEAGE
 # Test CA and two distinct leaf certificates; no real ACME requests.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
     -subj /CN=TestRoot -keyout /tmp/ca.key -out /tmp/ca.pem >/dev/null 2>&1
+install -m 644 /tmp/ca.pem /usr/local/share/ca-certificates/ikev2-test-root.crt
+update-ca-certificates >/dev/null
 printf 'subjectAltName=DNS:vpn.example.com\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > /tmp/leaf.ext
 for version in 1 2; do
     openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=vpn.example.com \
@@ -85,6 +88,36 @@ cp /tmp/key2.pem "$LINEAGE/privkey.pem"
 if sh config/certbot-deploy-hook.sh; then echo 'Mismatched key was accepted' >&2; exit 1; fi
 cmp /tmp/cert1.pem /etc/swanctl/x509/vpn-server.pem
 cp /tmp/key1.pem "$LINEAGE/privkey.pem"
+# An untrusted or not-yet-valid certificate must never replace the active pair.
+python3 - <<'PY'
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+ca = x509.load_pem_x509_certificate(Path('/tmp/ca.pem').read_bytes())
+leaf = x509.load_pem_x509_certificate(Path('/tmp/cert1.pem').read_bytes())
+key = serialization.load_pem_private_key(Path('/tmp/ca.key').read_bytes(), None)
+now = datetime.now(timezone.utc)
+cert = (x509.CertificateBuilder().subject_name(leaf.subject).issuer_name(ca.subject)
+        .public_key(leaf.public_key()).serial_number(33)
+        .not_valid_before(now + timedelta(days=1)).not_valid_after(now + timedelta(days=2))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName('vpn.example.com')]), False)
+        .sign(key, hashes.SHA256()))
+Path('/etc/letsencrypt/live/vpn.example.com/cert.pem').write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+PY
+if IKEV2_VPN_SKIP_RELOAD=1 sh config/certbot-deploy-hook.sh > /tmp/future-cert.log 2>&1; then
+    echo 'A not-yet-valid certificate was accepted' >&2; exit 1
+fi
+cmp /tmp/cert1.pem /etc/swanctl/x509/vpn-server.pem
+cp /tmp/cert1.pem "$LINEAGE/cert.pem"
+mv /usr/local/share/ca-certificates/ikev2-test-root.crt /tmp/untrusted-root.crt
+update-ca-certificates --fresh >/dev/null
+if IKEV2_VPN_SKIP_RELOAD=1 sh config/certbot-deploy-hook.sh > /tmp/untrusted-cert.log 2>&1; then
+    echo 'An untrusted certificate chain was accepted' >&2; exit 1
+fi
+cmp /tmp/cert1.pem /etc/swanctl/x509/vpn-server.pem
+mv /tmp/untrusted-root.crt /usr/local/share/ca-certificates/ikev2-test-root.crt
+update-ca-certificates >/dev/null
 CHARON=$(dpkg-query -L charon-systemd | while IFS= read -r path; do
     if [[ $path == */charon-systemd && -f $path && -x $path ]]; then printf '%s\n' "$path"; break; fi
 done)
@@ -138,6 +171,16 @@ cp /tmp/cert2.pem "$LINEAGE/cert.pem"
 cp /tmp/key2.pem "$LINEAGE/privkey.pem"
 SH
 chmod +x /test-bin/certbot
+# An inherited installation flag must not suppress scheduled renewal errors.
+cat > /test-bin/swanctl <<'SH'
+#!/bin/sh
+exit 42
+SH
+chmod +x /test-bin/swanctl
+if IKEV2_VPN_SKIP_RELOAD=1 bash scripts/renew.sh > /tmp/renew-failed.log 2>&1; then
+    echo 'Renewal incorrectly ignored a reload failure' >&2; exit 1
+fi
+rm /test-bin/swanctl
 bash scripts/renew.sh > /tmp/renew.log 2>&1
 grep 'renew --cert-name vpn.example.com' /tmp/certbot-calls
 python3 - <<'PY'

@@ -8,7 +8,7 @@ RUN --mount=type=secret,id=proxy_ca,required=true \
       $standard_plugins \
       strongswan-swanctl charon-systemd libcharon-extra-plugins libcharon-extauth-plugins \
       libstrongswan-extra-plugins nftables certbot python3-certbot-dns-cloudflare \
-      openssl shellcheck util-linux systemd && rm -rf /var/lib/apt/lists/*
+      openssl shellcheck util-linux systemd iproute2 procps && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
 COPY install.sh ./
 COPY scripts/ ./scripts/
