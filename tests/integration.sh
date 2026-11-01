@@ -85,7 +85,11 @@ cp /tmp/key2.pem "$LINEAGE/privkey.pem"
 if sh config/certbot-deploy-hook.sh; then echo 'Mismatched key was accepted' >&2; exit 1; fi
 cmp /tmp/cert1.pem /etc/swanctl/x509/vpn-server.pem
 cp /tmp/key1.pem "$LINEAGE/privkey.pem"
-python3 tests/restrict_address_families.py config/strongswan-hardening.conf /usr/sbin/charon-systemd >/tmp/charon.log 2>&1 &
+CHARON=$(dpkg-query -L charon-systemd | while IFS= read -r path; do
+    if [[ $path == */charon-systemd && -f $path && -x $path ]]; then printf '%s\n' "$path"; break; fi
+done)
+test -n "$CHARON"
+python3 tests/restrict_address_families.py config/strongswan-hardening.conf "$CHARON" >/tmp/charon.log 2>&1 &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
 for ((n=0; n<10; n++)); do
@@ -95,9 +99,17 @@ for ((n=0; n<10; n++)); do
 done
 if ! swanctl --load-all --noprompt > /tmp/load.log 2>&1; then cat /tmp/load.log /tmp/charon.log; exit 1; fi
 grep 'successfully loaded 1 connections' /tmp/load.log
-grep 'successfully loaded 2 pools' /tmp/load.log
+grep 'successfully loaded 1 pools' /tmp/load.log
 swanctl --list-pools > /tmp/pools.log
-grep '172.29.240.1' /tmp/pools.log
+python3 - <<'PY'
+import ipaddress
+from pathlib import Path
+rows = [line.split() for line in Path('/tmp/pools.log').read_text().splitlines() if line.strip()]
+assert len(rows) == 1 and rows[0][0] == 'vpn4', rows
+assert ipaddress.ip_address(rows[0][1]) in ipaddress.ip_network('172.29.240.0/24'), rows
+print('IPv4 pool verified:', rows[0][1])
+PY
+if grep -q vpn6 /tmp/pools.log; then echo 'Unexpected IPv6 address pool' >&2; exit 1; fi
 test "$(grep -c 'loaded eap secret' /tmp/load.log)" = 2
 swanctl --stats > /tmp/stats.log
 grep 'eap-mschapv2' /tmp/stats.log
@@ -148,6 +160,10 @@ bash scripts/renew.sh > /tmp/renew.log 2>&1
 grep -- --force-renewal /tmp/certbot-calls
 openssl x509 -in /etc/swanctl/x509/vpn-server.pem -noout -checkend 0
 # Check and apply twice in this container's isolated network namespace only.
+# Seed the previous IPv6 NAT table so upgrade cleanup is exercised as well.
+nft add table ip6 ikev2_vpn_nat6
+nft add chain ip6 ikev2_vpn_nat6 legacy
+nft add rule ip6 ikev2_vpn_nat6 legacy counter
 sed 's/SSH_PORTS/22,2222/' config/nftables-vpn.conf > /tmp/firewall.nft
 nft -c -f /tmp/firewall.nft
 nft -f /tmp/firewall.nft
@@ -156,4 +172,11 @@ nft list chain inet ikev2_vpn forward > /tmp/forward.log
 grep 'ipsec exists' /tmp/forward.log
 nft list chain ip ikev2_vpn_nat postrouting > /tmp/nat.log
 grep '172.29.240.0/24' /tmp/nat.log
+nft -j list tables > /tmp/tables.json
+python3 - <<'PY'
+import json
+from pathlib import Path
+tables = json.loads(Path('/tmp/tables.json').read_text())['nftables']
+assert not any(entry.get('table', {}).get('name') == 'ikev2_vpn_nat6' for entry in tables)
+PY
 printf 'Integration checks passed (no public ACME or iPhone test performed).\n'

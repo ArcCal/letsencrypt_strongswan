@@ -6,14 +6,21 @@ export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 export UCF_FORCE_CONFFOLD=1
 trap 'printf "Deployment failed at line %s. Fix the error above and rerun; existing accounts will be preserved.\n" "$LINENO" >&2' ERR
 die() { printf '%s\n' "$*" >&2; exit 1; }
+platform_supported() {
+    local minimum
+    case "$1" in
+        debian) minimum=12 ;;
+        ubuntu) minimum=22.04 ;;
+        *) return 1 ;;
+    esac
+    [[ $2 =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+    dpkg --compare-versions "$2" ge "$minimum"
+}
 [[ $EUID == 0 ]] || die 'Run as root or use sudo bash install.sh.'
 [[ -d /run/systemd/system ]] || die 'A VPS booted with systemd is required; ordinary containers are not supported.'
 # shellcheck disable=SC1091
 source /etc/os-release
-case "$ID:$VERSION_ID" in
-    debian:13|ubuntu:24.04|ubuntu:26.04) ;;
-    *) die 'Supported systems: Debian 13 and Ubuntu 24.04/26.04.' ;;
-esac
+platform_supported "${ID:-}" "${VERSION_ID:-}" || die 'Supported systems: Debian 12 or later, and Ubuntu 22.04 or later.'
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 for file in scripts/vpn.py scripts/renew.sh config/certbot-deploy-hook.sh config/nftables-vpn.conf config/99-vpn-sysctl.conf config/strongswan-hardening.conf config/renew-hardening.conf; do
     [[ -f "$REPO/$file" ]] || die 'The embedded payload is incomplete. Download install.sh again.'
@@ -36,9 +43,15 @@ if dpkg-query -W -f='${Status}' strongswan-starter 2>/dev/null | grep -q 'instal
     die 'Legacy strongswan-starter is installed. Migrate it first; it will not be removed automatically.'
 fi
 apt-get update
+SWAN_PACKAGES=(strongswan-swanctl charon-systemd libcharon-extra-plugins
+    libcharon-extauth-plugins libstrongswan-extra-plugins)
+# Debian 12 splits OpenSSL/certificate plugins into this package; other
+# releases include them in libstrongswan or use a different package split.
+if apt-cache show libstrongswan-standard-plugins >/dev/null 2>&1; then
+    SWAN_PACKAGES+=(libstrongswan-standard-plugins)
+fi
 apt-get install -y -o Dpkg::Options::=--force-confold --no-install-recommends \
-    strongswan-swanctl charon-systemd libcharon-extra-plugins \
-    libcharon-extauth-plugins libstrongswan-extra-plugins nftables \
+    "${SWAN_PACKAGES[@]}" nftables \
     certbot python3-certbot-dns-cloudflare python3 openssl iproute2 ca-certificates
 
 # Refuse unmanaged rules/configuration instead of flushing someone else's firewall.
@@ -94,15 +107,6 @@ unset IKEV2_VPN_SKIP_RELOAD
 flock -u 8
 
 install -m 644 "$REPO/config/99-vpn-sysctl.conf" /etc/sysctl.d/99-ikev2-vpn.conf
-# accept_ra must be set for existing interfaces too, before enabling IPv6 forwarding.
-for interface in /proc/sys/net/ipv6/conf/*/accept_ra; do
-    if [[ -f $interface ]]; then
-        printf '2\n' > "$interface"
-        interface_name=${interface%/accept_ra}
-        interface_name=${interface_name##*/}
-        printf 'net/ipv6/conf/%s/accept_ra = 2\n' "$interface_name" >> /etc/sysctl.d/99-ikev2-vpn.conf
-    fi
-done
 sysctl -p /etc/sysctl.d/99-ikev2-vpn.conf
 install -d -m 755 /etc/ikev2-vpn
 install -m 644 "$REPO/config/nftables-vpn.conf" /etc/ikev2-vpn/firewall.nft

@@ -6,9 +6,9 @@ The server authenticates with a Let's Encrypt certificate. Clients authenticate 
 
 ## 1. Requirements
 
-- A fresh, dedicated Debian 13 or Ubuntu 24.04 / 26.04 VPS booted with **systemd**, with a root terminal. The installer uses distribution packages, without compiling strongSwan.
-- An inbound-reachable public IPv4 address, either assigned directly to a NIC or mapped to its private address by the cloud provider, such as a Google Compute Engine External IP. Public IPv6 is optional. Ordinary containers are not supported for production deployment.
-- Kernel support for IPsec/XFRM, ESP, nftables, and IPv6. IPv6 kernel support is required for the dual-stack tunnel even without a public IPv6 address. A running IKE daemon alone does not prove ESP data-plane support.
+- A fresh, dedicated **Debian 12 or later**, or **Ubuntu 22.04 or later**, VPS booted with **systemd**, with a root terminal. Only these two distribution families are accepted; RHEL, Rocky, AlmaLinux, CentOS, Fedora, and other distributions are not supported. The installer uses distribution packages, without compiling strongSwan. Working distribution apt repositories are required; an end-of-life release with unavailable repositories cannot be installed automatically.
+- An inbound-reachable public IPv4 address, either assigned directly to a NIC or mapped to its private address by the cloud provider, such as a Google Compute Engine External IP. Ordinary containers are not supported for production deployment.
+- Kernel support for IPsec/XFRM, ESP, and nftables. Standard distribution IPv6 netfilter support is used to remove a legacy IPv6 NAT table on upgrades; clients receive IPv4 addresses only. A running IKE daemon alone does not prove ESP data-plane support.
 - An active Cloudflare DNS zone for the certificate domain, for example `vpn.example.com`. **The domain does not need to point to the VPS or have A/AAAA records.**
 - Allow inbound **UDP 500 and UDP 4500** in the cloud security group and upstream firewall. For plain ESP without NAT-T, allow **IP protocol 50**, not UDP port 50. Preserve SSH access.
 - Access to distribution package repositories, Cloudflare API, Let's Encrypt ACME API, and `api.ipify.org`. The system clock must be accurate.
@@ -72,14 +72,18 @@ The installer automatically:
 3. Generates and persists two cryptographically random accounts and renders server configuration and Apple profiles.
 4. Obtains an ECDSA P-256 certificate through certbot DNS-01, with a 60-second DNS propagation delay. Ports 80/443 are not required.
 5. Deploys the leaf certificate, private key, and individually split intermediate certificates after checking expiration, hostname, and key matching.
-6. Configures forwarding, IPv6 RA handling, dedicated nftables tables, boot services, and the certificate timer.
+6. Configures IPv4 forwarding, dedicated nftables tables, boot services, and the certificate timer; removes legacy VPN IPv6 forwarding/NAT.
 7. Starts strongSwan, loads accounts, certificates, connections, and pools, and checks service status.
 
 Package installation and DNS propagation can take several minutes. Errors from networking, Cloudflare, the CA, or the firewall stop deployment with diagnostic output. A Cloudflare token cannot modify cloud-provider security groups or repair blocked upstream UDP traffic.
 
+The installer accounts for distribution package splits: when available, it explicitly installs `libstrongswan-standard-plugins` for certificate/OpenSSL support, including on Debian 12. No strongSwan source compilation is used.
+
 ## 4. Random accounts and output files
 
 Each username has **8 uppercase/lowercase letters and digits**, including at least one uppercase letter, one lowercase letter, and one digit. Each password has **22 characters**, including uppercase/lowercase letters, digits, and at least one symbol from `!@#%+-_=.:?`. This alphabet avoids configuration escaping problems. Generation uses Python `secrets`, backed by the operating system random source. The two usernames are distinct.
+
+Both profiles use the display name **IKEv2 IPSec VPN**, including the profile title and VPN entry in iPhone Settings. Usernames and passwords remain random and distinct. Each user should install only their own profile; the account summary identifies the corresponding username and file.
 
 ```sh
 cat /tmp/usr.txt
@@ -88,11 +92,11 @@ ls -l /var/lib/ikev2-vpn/profiles/
 
 | File | Contents |
 | --- | --- |
-| `/tmp/usr.txt` | Both random accounts, server endpoint, and profile paths |
+| `/tmp/usr.txt` | Both random accounts, VPN display names, server endpoint, and profile paths |
 | `/var/lib/ikev2-vpn/profiles/<username>.mobileconfig` | One iPhone profile per user, including that user's credentials |
 | `/var/lib/ikev2-vpn/state.json` | Persistent account state and server IP; accounts are reused on rerun |
 | `/etc/letsencrypt/cloudflare.ini` | Cloudflare token for certificate renewal |
-| `/etc/swanctl/conf.d/ikev2-vpn.conf` | Generated connection, dual-stack pools, and both EAP accounts |
+| `/etc/swanctl/conf.d/ikev2-vpn.conf` | Generated connection, IPv4 pool, and both EAP accounts |
 
 Credential files are root-owned with mode `0600`. Do not publish them in Git, on a web server, or to other users. Give each user only their own profile. Passwords are not printed to the terminal, and the installer does not start a public profile-download service.
 
@@ -110,16 +114,28 @@ Profiles use Apple's standard `com.apple.vpn.managed` **IKEv2** payload for mode
 
 1. Download the user's `.mobileconfig` through SCP/SFTP to a trusted computer. Transfer it to the corresponding iPhone using AirDrop, trusted device management, or another secure channel.
 2. Open the file on iPhone. Install it in Settings > Profile Downloaded or Settings > General > VPN & Device Management. iOS requires device authentication and installation confirmation.
-3. Enable the configuration in Settings > VPN. Server IP, remote domain identity, username, and password are already filled in. Domain address resolution is not required.
+3. Select **IKEv2 IPSec VPN** in Settings > VPN. Server IP, remote domain identity, username, and password are already filled in. Domain address resolution is not required. The profile enables automatic on-demand connection.
 4. Check the public IP in a browser after connecting; it should show the VPS exit address. Check DNS and IPv6 routing as well.
 
 The server cannot replace the user's profile-installation and VPN-enable actions. Profiles are **unsigned XML plists**, so iOS may label them unsigned. Profile signing and server certificate trust are separate. No CA, client certificate, MDM enrollment, or device supervision is installed.
 
+After updating the server, install the regenerated profile to apply display-name or on-demand changes. An already installed profile does not update its name or policy when the server restarts. If an old manually created VPN entry remains, remove that entry yourself and select the newly installed profile; the server cannot rename unrelated entries on the phone.
+
+### Automatic connection versus locked Always On
+
+On a personal, unsupervised iPhone, this profile uses `OnDemandEnabled=1`, an unconditional `Connect` rule, and `OnDemandUserOverrideDisabled=1`. The last setting disables the **Connect On Demand** settings toggle for this configuration on supported iOS versions. Credentials are embedded so the connection does not need interactive authentication.
+
+These settings **do not prevent the user from disabling the VPN connection or removing the profile**. They are not Apple's supervised Always On VPN. The installer does not set misleading `AlwaysOn` or non-removal flags that cannot enforce the requested policy on a personal device.
+
+A connection users cannot disable requires a **supervised device** and an appropriate management deployment using Apple's `VPNType=AlwaysOn` and `AlwaysOn.UIToggleEnabled=0`, with management controls for profile removal. That device-management workflow is not provided by a manually installed personal-device profile. See [Apple IKEv2 deployment settings](https://support.apple.com/guide/deployment/ikev2-settings-dep4ce9487d/web) and the [official VPN payload schema](https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.vpn.managed.yaml).
+
 `AuthenticationMethod=None` with `ExtendedAuthEnabled=1` selects EAP username/password authentication. `RemoteAddress` is the server public IP. `RemoteIdentifier` and `ServerCertificateCommonName` are the certificate domain. Public CA chain and server identity checks remain enabled; an IP SAN is not required. **Password-based client authentication does not disable server certificate verification.**
 
-IKE and ESP use AES-256/SHA-256 with DH group 14, explicitly matched between the server and Apple profile. Profiles enable MOBIKE, PFS, and `IncludeAllNetworks`, disable local-network bypass, and request `0.0.0.0/0, ::/0` traffic selectors. Apple still excludes certain system traffic, such as DHCP, captive-network login, some cellular services, and companion-device communication. This is not a supervised Always On VPN. Traffic is not protected after the user disables the VPN.
+IKE and ESP use AES-256/SHA-256 with DH group 14, explicitly matched between the server and Apple profile. Profiles enable MOBIKE, PFS, and `IncludeAllNetworks`, disable local-network bypass, and use the IPv4 traffic selector `0.0.0.0/0`. Apple still excludes certain system traffic, such as DHCP, captive-network login, some cellular services, and companion-device communication. This is not a supervised Always On VPN. Traffic is not protected after the user disables the VPN.
 
-Client pools are `172.29.240.0/24` and `fd10:10:10::/64`, using NAT44 and NAT66. Without a public IPv6 uplink, client IPv6 stays within the tunnel but cannot reach the IPv6 internet; it is not deliberately sent through the local network. Choose an IPv6-capable VPS if IPv6 internet access is required.
+Clients receive only an IPv4 address from `172.29.240.0/24`, using NAT44. There is no IPv6 address pool, private IPv6 assignment, IPv6 DNS assignment, or NAT66. Upgrades remove the previous managed IPv6 NAT table, turn off managed IPv6 forwarding, and stop changing host RA settings. The server's own IPv6 addresses and networking are not disabled.
+
+The generated Apple profile retains `IncludeAllNetworks=1` and `ExcludeLocalNetworks=0`; removing IPv6 address allocation must not enable native IPv6 bypass. IPv6 internet service is not provided. Verify this policy on the actual iPhone with an IPv6 leak check after connecting; complete device behaviour is not verified in container tests. Other clients, including the manual Linux example, need their own native IPv6 blocking policy if required.
 
 The IPv4 pool is outside `10.10.0.0/16`. On an existing installation, rerun the updated installer to apply the pool, forwarding, and NAT settings together. Accounts and profile identities remain unchanged. Disconnect and reconnect clients to receive addresses from the new pool; reinstalling Apple profiles is not required because pool addresses are assigned by the server. No private subnet can avoid every possible client LAN, so check for overlap if using other local networks.
 
@@ -152,9 +168,9 @@ Keep the token valid. Unreachable APIs, expired token permissions, and DNS propa
 | `/usr/local/lib/ikev2-vpn/` | Installed state/configuration and certificate tools, independent of the checkout |
 | `/etc/letsencrypt/renewal-hooks/deploy/ikev2-vpn` | Certificate deployment and credential hot reload |
 | `/etc/ikev2-vpn/firewall.nft` | Firewall with detected SSH ports substituted |
-| `/etc/sysctl.d/99-ikev2-vpn.conf` | IP forwarding and IPv6 RA settings |
+| `/etc/sysctl.d/99-ikev2-vpn.conf` | IPv4 forwarding and disabling managed IPv6 forwarding |
 | `strongswan.service` | IKEv2 daemon, loading connections, accounts, and certificates at startup |
-| `ikev2-vpn-firewall.service` | The three managed nftables tables, started before strongSwan |
+| `ikev2-vpn-firewall.service` | The two managed nftables tables and legacy IPv6 NAT removal, started before strongSwan |
 | `ikev2-vpn-renew.service/.timer` | Certificate checks, renewal, deployment, and reload |
 
 ```sh
@@ -176,7 +192,7 @@ nft list ruleset
 | Connected without internet | Forwarding, default routes, firewall, CHILD_SA, and upstream network; IKE_SA alone does not establish a working data plane |
 | Large pages or network switching stall | MTU/MSS and blocked UDP; MSS clamping precedes accepting firewall rules |
 | SSH is blocked | Recover through the cloud console; check SSH ports in the managed firewall, validate with `nft -c -f`, then restart its service |
-| IPv6 default route disappears after reboot | Actual interface `accept_ra=2`, provider configuration, and the IPv6 default route |
+| A previous private IPv6 address still appears on iPhone | Disconnect and reconnect after updating the server; new sessions receive only an IPv4 address |
 
 There is no automatic uninstall. Reverse firewall and forwarding changes according to the server's networking requirements. Back up account state, the token, ACME data, and profiles securely with encryption.
 
@@ -238,6 +254,8 @@ docker run --rm --network none --cap-drop ALL \
   --security-opt no-new-privileges \
   ikev2-vpn-test:local bash /repo/tests/integration.sh
 ```
+
+Use `--build-arg BASE_IMAGE=debian:12-slim` or `--build-arg BASE_IMAGE=ubuntu:22.04` to exercise the minimum supported releases. The default test image uses Debian 13. The daemon executable is discovered from the `charon-systemd` package rather than assuming the same installation path across releases.
 
 Tests include static validation of systemd units/drop-ins and real daemon startup with reduced capabilities. The container does not run full systemd, so its sandbox and boot behaviour are not fully verified. Validation does not cover a real VPS installation/reboot, live Cloudflare writes and Let's Encrypt issuance, physical iPhone 18 Pro Max installation/connection, or end-to-end internet ESP/NAT traffic. Profiles follow the [official Apple device-management schema](https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.vpn.managed.yaml); parsing a plist does not establish physical-device compatibility.
 

@@ -18,6 +18,7 @@ import uuid
 STATE = Path('/var/lib/ikev2-vpn')
 SYMBOLS = '!@#%+-_=.:?'
 IPV4_POOL = ipaddress.IPv4Network('172.29.240.0/24')
+PROFILE_NAME = 'IKEv2 IPSec VPN'
 
 
 def write_private(path, data, mode=0o600):
@@ -86,13 +87,14 @@ def load_state(root, domain):
 
 def profile(domain, user, address):
     name = user['username']
+    label = PROFILE_NAME
     identifier = 'org.ikev2-vpn.' + domain + '.' + name
     sa = {'EncryptionAlgorithm': 'AES-256', 'IntegrityAlgorithm': 'SHA2-256',
           'DiffieHellmanGroup': 14, 'LifeTimeInMinutes': 60}
     vpn = {
         'PayloadType': 'com.apple.vpn.managed', 'PayloadVersion': 1,
         'PayloadIdentifier': identifier + '.vpn', 'PayloadUUID': str(uuid.uuid5(uuid.NAMESPACE_DNS, identifier + '.vpn')),
-        'PayloadDisplayName': domain + ' (' + name + ')', 'UserDefinedName': domain + ' (' + name + ')',
+        'PayloadDisplayName': label, 'UserDefinedName': label,
         'VPNType': 'IKEv2', 'IPv4': {'OverridePrimary': 1},
         'IKEv2': {
             'RemoteAddress': address, 'RemoteIdentifier': domain, 'LocalIdentifier': name,
@@ -103,12 +105,14 @@ def profile(domain, user, address):
             'IKESecurityAssociationParameters': dict(sa, LifeTimeInMinutes=240),
             'ChildSecurityAssociationParameters': sa,
             'IncludeAllNetworks': 1, 'ExcludeLocalNetworks': 0,
+            'OnDemandEnabled': 1, 'OnDemandUserOverrideDisabled': 1,
+            'OnDemandRules': [{'Action': 'Connect'}],
         },
     }
     return plistlib.dumps({
         'PayloadType': 'Configuration', 'PayloadVersion': 1,
         'PayloadIdentifier': identifier, 'PayloadUUID': str(uuid.uuid5(uuid.NAMESPACE_DNS, identifier)),
-        'PayloadDisplayName': domain + ' VPN (' + name + ')',
+        'PayloadDisplayName': label,
         'PayloadDescription': 'IKEv2 full-tunnel VPN with username/password login and public CA server certificate validation.',
         'PayloadContent': [vpn],
     })
@@ -123,7 +127,7 @@ connections {{
     ikev2-eap {{
         version = 2
         local_addrs = %any
-        pools = vpn4, vpn6
+        pools = vpn4
         proposals = aes256-sha256-modp2048
         mobike = yes
         fragmentation = yes
@@ -140,7 +144,7 @@ connections {{
         }}
         children {{
             net {{
-                local_ts = 0.0.0.0/0, ::/0
+                local_ts = 0.0.0.0/0
                 esp_proposals = aes256-sha256-modp2048
                 reqid = 1
                 dpd_action = clear
@@ -153,19 +157,16 @@ pools {{
         addrs = {IPV4_POOL}
         dns = 1.1.1.1, 1.0.0.1
     }}
-    vpn6 {{
-        addrs = fd10:10:10::/64
-        dns = 2606:4700:4700::1111, 2606:4700:4700::1001
-    }}
 }}
 secrets {{
 '''
     output = ['Server IP: ' + address, 'Certificate domain / Remote ID: ' + domain]
     for user in data['users']:
         name, password = user['username'], user['password']
+        label = PROFILE_NAME
         text += f'    eap-{name} {{\n        id = {name}\n        secret = "{password}"\n    }}\n'
         write_private(root / f'var/lib/ikev2-vpn/profiles/{name}.mobileconfig', profile(domain, user, address))
-        output.extend(['', 'Username: ' + name, 'Password: ' + password,
+        output.extend(['', 'VPN name: ' + label, 'Username: ' + name, 'Password: ' + password,
                        'Profile: /var/lib/ikev2-vpn/profiles/' + name + '.mobileconfig'])
     write_private(root / 'etc/swanctl/conf.d/ikev2-vpn.conf', text + '}\n')
     write_private(root / 'tmp/usr.txt', '\n'.join(output) + '\n')

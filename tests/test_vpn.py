@@ -99,6 +99,9 @@ class DeploymentTests(unittest.TestCase):
                 self.assertTrue((root / f"var/lib/ikev2-vpn/profiles/{u['username']}.mobileconfig").read_text().isascii())
                 self.assertEqual(len(profile['PayloadContent']), 1)  # No client or CA certificate payload.
                 payload = profile['PayloadContent'][0]
+                self.assertEqual(profile['PayloadDisplayName'], 'IKEv2 IPSec VPN')
+                self.assertEqual(payload['PayloadDisplayName'], 'IKEv2 IPSec VPN')
+                self.assertEqual(payload['UserDefinedName'], 'IKEv2 IPSec VPN')
                 self.assertEqual(payload['VPNType'], 'IKEv2')
                 ike = payload['IKEv2']
                 self.assertEqual(ike['AuthName'], u['username'])
@@ -107,6 +110,11 @@ class DeploymentTests(unittest.TestCase):
                 self.assertEqual(ike['ExtendedAuthEnabled'], 1)
                 self.assertEqual(ike['IncludeAllNetworks'], 1)
                 self.assertEqual(ike['ExcludeLocalNetworks'], 0)
+                self.assertEqual(ike['OnDemandEnabled'], 1)
+                self.assertEqual(ike['OnDemandUserOverrideDisabled'], 1)
+                self.assertEqual(ike['OnDemandRules'], [{'Action': 'Connect'}])
+                self.assertNotIn('AlwaysOn', payload)
+                self.assertNotIn('PayloadRemovalDisallowed', profile)
                 self.assertEqual(ike['RemoteIdentifier'], data['domain'])
                 self.assertEqual(ike['RemoteAddress'], data['server_address'])
                 self.assertNotEqual(ike['RemoteAddress'], ike['RemoteIdentifier'])
@@ -115,8 +123,13 @@ class DeploymentTests(unittest.TestCase):
                 self.assertIn(u['password'], server)
                 self.assertIn(u['username'], summary)
                 self.assertIn(u['password'], summary)
+                self.assertIn('VPN name: IKEv2 IPSec VPN', summary)
             self.assertTrue(summary.isascii())
-            self.assertIn('local_ts = 0.0.0.0/0, ::/0', server)
+            self.assertIn('local_ts = 0.0.0.0/0\n', server)
+            self.assertNotIn('vpn6', server)
+            self.assertNotIn('::', server)
+            pools = re.findall(r'addrs\s*=\s*([^\s]+/\d+)', server)
+            self.assertEqual([ipaddress.ip_network(pool).version for pool in pools], [4])
 
     def test_export_replaces_symlink_without_touching_target(self):
         with tempfile.TemporaryDirectory() as tmp:
