@@ -132,6 +132,8 @@ class DeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             data = vpn.load_state(root / 'var/lib/ikev2-vpn', 'vpn.example.com')
+            # Colons in credentials must not be mistaken for IPv6 configuration.
+            data['users'][0]['password'] = 'Aa1::' + 'x' * 17
             data['server_address'] = '203.0.113.10'
             vpn.render(data, root)
             server = (root / 'etc/swanctl/conf.d/ikev2-vpn.conf').read_text()
@@ -169,7 +171,7 @@ class DeploymentTests(unittest.TestCase):
             self.assertTrue(summary.isascii())
             self.assertIn('local_ts = 0.0.0.0/0\n', server)
             self.assertNotIn('vpn6', server)
-            self.assertNotIn('::', server)
+            self.assertNotIn('::', server.split('secrets {', 1)[0])
             pools = re.findall(r'addrs\s*=\s*([^\s]+/\d+)', server)
             self.assertEqual([ipaddress.ip_network(pool).version for pool in pools], [4])
 
